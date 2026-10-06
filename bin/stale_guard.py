@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
-"""Cold-cache guard engine: transcript inspection, condensing and local-LLM handoff.
+"""Cold-cache guard engine: transcript inspection, condensing and handoff writing.
 
-Called by the plugin's hooks module (hooks/register.ts), which owns the UI:
+Called by the plugin's hooks module (hooks/register.ts), which owns the UI and,
+for the Anthropic provider, the model call itself ($.model.complete):
 
     stale_guard.py check   --session-id ID
         -> {"stale", "idle_minutes", "threshold_minutes", "ttl_minutes", "context_tokens", "transcript",
-            "local_model", "local_unavailable_reason"}   (local_* only when stale)
-    stale_guard.py handoff --session-id ID --cwd DIR   (held prompt, if any, on stdin)
-        -> {"ok": true, "path", "model", "seconds", "condensed_chars", "text"}
-         | {"ok": false, "error"}
+            "provider", "handoff_model", "handoff_unavailable_reason", "offer_auto_handoff"}
+           (the handoff_* and offer_* keys only when stale)
+    stale_guard.py prepare --session-id ID --cwd DIR
+        -> {"ok": true, "provider", "model", "effort", "max_output_tokens", "timeout_seconds",
+            "system", "prompt", "condensed_chars"}
+    stale_guard.py complete --model M          ({"system", "prompt"} JSON on stdin; local provider only)
+        -> {"ok": true, "text"}
+    stale_guard.py save --session-id ID --cwd DIR --provider P --model M   ({"body", "held"} JSON on stdin)
+        -> {"ok": true, "path", "text"}
+
+Every command answers {"ok": false, "error"} on failure.
 
 The session transcript (.jsonl) is only ever read; trimming happens in memory on
-a condensed copy that is sent to the local model.
+a condensed copy that is sent to the summarizing model.
 """
 
 import argparse
@@ -19,7 +27,6 @@ import json
 import os
 import re
 import sys
-import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -42,11 +49,20 @@ def load_config():
         "STALE_GUARD_LLM_URL": "llm_base_url",
         "STALE_GUARD_MODEL": "model",
         "STALE_GUARD_MAX_CHARS": "max_transcript_chars",
+        "STALE_GUARD_PROVIDER": "provider",
+        "STALE_GUARD_ANTHROPIC_MODEL": "anthropic_model",
+        "STALE_GUARD_ANTHROPIC_EFFORT": "anthropic_effort",
     }
     for var, key in env.items():
         if os.environ.get(var):
             cfg[key] = os.environ[var]
     return cfg
+
+
+def as_bool(value):
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
 
 
 # ---------------------------------------------------------------- transcript reading
@@ -303,15 +319,7 @@ def probe_model(cfg, timeout=1.5):
     return (ids[0], None) if ids else (None, f"the server at {base} has no models")
 
 
-def pick_model(cfg):
-    model, reason = probe_model(cfg, timeout=10)
-    if not model:
-        raise RuntimeError(reason)
-    return model
-
-
-def run_local_llm(cfg, system_prompt, user_content):
-    model = pick_model(cfg)
+def run_local_llm(cfg, model, system_prompt, user_content):
     body = {
         "model": model,
         "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}],
@@ -330,7 +338,39 @@ def run_local_llm(cfg, system_prompt, user_content):
             f"{model} returned no answer (finish_reason={choice.get('finish_reason')}, "
             f"{reasoning} chars of reasoning). If finish_reason is 'length', raise max_output_tokens."
         )
-    return model, text
+    return text
+
+
+# ---------------------------------------------------------------- providers
+
+PROVIDERS = ("local", "anthropic")
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+def provider_of(cfg):
+    return str(cfg.get("provider", "anthropic")).strip().lower()
+
+
+def handoff_backend(cfg, timeout=1.5):
+    """Return (provider, model, None) when a handoff can be generated, else (provider, None, reason).
+
+    The local provider is probed; the Anthropic one goes through the session's own
+    API client, so it is always available (the engine rejects a model it won't send).
+    """
+    provider = provider_of(cfg)
+    if provider == "anthropic":
+        effort = str(cfg.get("anthropic_effort", "low")).lower()
+        if effort not in EFFORTS:
+            return provider, None, f"anthropic_effort must be one of {', '.join(EFFORTS)}, not {effort!r}"
+        return provider, cfg.get("anthropic_model") or "haiku", None
+    if provider == "local":
+        model, reason = probe_model(cfg, timeout=timeout)
+        return provider, model, reason
+    return provider, None, f"provider must be one of {', '.join(PROVIDERS)}, not {provider!r}"
+
+
+def summarizer_label(provider, model):
+    return f"Claude ({model})" if provider == "anthropic" else f"a local model ({model})"
 
 
 # ---------------------------------------------------------------- commands
@@ -350,40 +390,67 @@ def cmd_check(cfg, args):
                threshold_minutes=limit, ttl_minutes=ttl or float(cfg.get("fallback_ttl_minutes", 60)),
                context_tokens=ctx)
     if out["stale"]:  # only probe when the answer will be shown
-        out["local_model"], out["local_unavailable_reason"] = probe_model(cfg)
+        out["provider"], out["handoff_model"], out["handoff_unavailable_reason"] = handoff_backend(cfg)
+        out["offer_auto_handoff"] = as_bool(cfg.get("offer_auto_handoff", False))
     return out
 
 
-def cmd_handoff(cfg, args):
+def read_stdin_json():
+    return json.loads(sys.stdin.read() or "{}")
+
+
+def cmd_prepare(cfg, args):
     transcript = find_transcript(args.session_id)
     if not transcript:
         return {"ok": False, "error": f"no transcript found for session {args.session_id}"}
-    held = sys.stdin.read().strip() if not sys.stdin.isatty() else ""
+    provider, model, reason = handoff_backend(cfg, timeout=10)
+    if not model:
+        return {"ok": False, "error": reason}
+
     last_ts, _, _ = session_activity(transcript)
     idle_note = fmt_duration((datetime.now(timezone.utc) - last_ts).total_seconds() / 60) + " ago" if last_ts else "unknown"
-
-    started = time.time()
     condensed = condense(transcript, int(cfg.get("max_transcript_chars", 100000)))
-    system_prompt = (PLUGIN_ROOT / "prompts" / "handoff-system.md").read_text()
-    user_content = (
-        f"Project directory: {args.cwd}\n"
-        f"Last activity in session: {idle_note}\n\n"
-        f"<transcript>\n{condensed}\n</transcript>\n\n"
-        "Write the handoff document now, following the required format exactly."
-    )
+    return {
+        "ok": True,
+        "provider": provider,
+        "model": model,
+        "effort": str(cfg.get("anthropic_effort", "low")).lower(),
+        "max_output_tokens": int(cfg.get("max_output_tokens", 4096)),
+        "timeout_seconds": float(cfg.get("request_timeout_seconds", 540)),
+        "system": (PLUGIN_ROOT / "prompts" / "handoff-system.md").read_text(),
+        "prompt": (
+            f"Project directory: {args.cwd}\n"
+            f"Last activity in session: {idle_note}\n\n"
+            f"<transcript>\n{condensed}\n</transcript>\n\n"
+            "Write the handoff document now, following the required format exactly."
+        ),
+        "condensed_chars": len(condensed),
+    }
+
+
+def cmd_complete(cfg, args):
+    req = read_stdin_json()
     try:
-        model, body = run_local_llm(cfg, system_prompt, user_content)
+        text = run_local_llm(cfg, args.model, req["system"], req["prompt"])
     except (urllib.error.URLError, TimeoutError, OSError, RuntimeError, KeyError, ValueError) as exc:
         return {"ok": False, "error": f"local model at {cfg['llm_base_url']}: {exc}"}
+    return {"ok": True, "text": text}
 
+
+def cmd_save(cfg, args):
+    req = read_stdin_json()
+    body, held = (req.get("body") or "").strip(), (req.get("held") or "").strip()
+    if not body:
+        return {"ok": False, "error": "the model's handoff was empty"}
+    transcript = find_transcript(args.session_id)
     handoff = (
         "# Handoff from a previous Claude Code session\n\n"
-        f"You are continuing work from an earlier Claude Code session in `{args.cwd}` that was summarized by a "
-        "local model to avoid re-reading its full history. Treat this as your working context, but verify "
-        "file and repo state before relying on specifics.\n\n"
-        f"If you need an exact detail, the full original transcript is at `{transcript}` "
-        "(JSONL, read-only — search it rather than reading it whole).\n\n"
-        + body.strip() + "\n"
+        f"You are continuing work from an earlier Claude Code session in `{args.cwd}` that was summarized by "
+        f"{summarizer_label(args.provider, args.model)} to avoid re-reading its full history. Treat this as your "
+        "working context, but verify file and repo state before relying on specifics.\n\n"
+        + (f"If you need an exact detail, the full original transcript is at `{transcript}` "
+           "(JSONL, read-only — search it rather than reading it whole).\n\n" if transcript else "")
+        + body + "\n"
     )
     if held:
         handoff += f"\n## The user's next message\n\n{held}\n"
@@ -392,9 +459,7 @@ def cmd_handoff(cfg, args):
     out_dir.mkdir(parents=True, exist_ok=True)
     out_file = out_dir / f"{datetime.now():%Y%m%d-%H%M%S}-{args.session_id[:8]}.md"
     out_file.write_text(handoff)
-    return {"ok": True, "path": str(out_file), "model": model, "seconds": int(time.time() - started),
-            "condensed_chars": len(condensed),
-            "text": handoff}
+    return {"ok": True, "path": str(out_file), "text": handoff}
 
 
 def main():
@@ -402,14 +467,22 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     check = sub.add_parser("check")
     check.add_argument("--session-id", required=True)
-    handoff = sub.add_parser("handoff")
-    handoff.add_argument("--session-id", required=True)
-    handoff.add_argument("--cwd", default=os.getcwd())
+    prepare = sub.add_parser("prepare")
+    prepare.add_argument("--session-id", required=True)
+    prepare.add_argument("--cwd", default=os.getcwd())
+    complete = sub.add_parser("complete")
+    complete.add_argument("--model", required=True)
+    save = sub.add_parser("save")
+    save.add_argument("--session-id", required=True)
+    save.add_argument("--cwd", default=os.getcwd())
+    save.add_argument("--provider", required=True, choices=PROVIDERS)
+    save.add_argument("--model", required=True)
     args = parser.parse_args()
 
+    commands = {"check": cmd_check, "prepare": cmd_prepare, "complete": cmd_complete, "save": cmd_save}
     cfg = load_config()
     try:
-        result = cmd_check(cfg, args) if args.command == "check" else cmd_handoff(cfg, args)
+        result = commands[args.command](cfg, args)
     except Exception as exc:  # report, never traceback, so the caller can show it
         result = {"ok": False, "stale": False, "error": f"{type(exc).__name__}: {exc}"}
     print(json.dumps(result))

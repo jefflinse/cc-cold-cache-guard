@@ -1,7 +1,10 @@
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, ModelEffort, Register } from 'claude-code'
 
-// The heavy lifting (reading the transcript, condensing it, calling LM Studio)
-// lives in bin/stale_guard.py; this module owns the interaction.
+// The heavy lifting (reading the transcript, condensing it, calling LM Studio,
+// writing the handoff file) lives in bin/stale_guard.py; this module owns the
+// interaction, and makes the model call itself when the provider is Anthropic.
+
+type Provider = 'local' | 'anthropic'
 
 type Check = {
   stale: boolean
@@ -9,22 +12,33 @@ type Check = {
   idle_text?: string
   ttl_minutes: number | null
   context_tokens: number | null
-  /** Only present when stale: the local model a handoff would use, or why there is none. */
-  local_model?: string | null
-  local_unavailable_reason?: string | null
+  /** Only present when stale: the model a handoff would use, or why there is none. */
+  provider?: Provider
+  handoff_model?: string | null
+  handoff_unavailable_reason?: string | null
+  offer_auto_handoff?: boolean
   error?: string
 }
 
-type Handoff =
+type Failure = { ok: false; error: string }
+
+type Prepared =
   | {
       ok: true
-      path: string
+      provider: Provider
       model: string
-      seconds: number
+      effort: ModelEffort
+      max_output_tokens: number
+      timeout_seconds: number
+      system: string
+      prompt: string
       condensed_chars: number
-      text: string
     }
-  | { ok: false; error: string }
+  | Failure
+
+type Completed = { ok: true; text: string; note?: string } | Failure
+
+type Saved = { ok: true; path: string; text: string } | Failure
 
 const HANDOFF_TIMEOUT_MS = 600_000 // $.process.run's ceiling
 
@@ -40,6 +54,23 @@ let handoffRunning = false
 
 function script($: EngineInterface) {
   return `${$.plugin.root}/bin/stale_guard.py`
+}
+
+/** Runs one stale_guard.py command; output that isn't JSON becomes a failure. */
+async function engine<T extends { ok: boolean }>(
+  $: EngineInterface,
+  args: string[],
+  stdin = '',
+): Promise<T | Failure> {
+  const { stdout, stderr } = await $.process.run(['python3', script($), ...args], {
+    stdin,
+    timeoutMs: HANDOFF_TIMEOUT_MS,
+  })
+  try {
+    return JSON.parse(stdout) as T
+  } catch {
+    return { ok: false, error: (stderr || stdout).trim().slice(0, 500) || 'no output' }
+  }
 }
 
 async function check($: EngineInterface): Promise<Check | null> {
@@ -58,9 +89,57 @@ function shortModel(id: string) {
   return id.split('/').pop() || id
 }
 
+function describeModel(provider: Provider | undefined, model: string) {
+  return provider === 'anthropic' ? `${model} (Anthropic)` : `${shortModel(model)} (local, free)`
+}
+
+async function summarize($: EngineInterface, p: Extract<Prepared, { ok: true }>): Promise<Completed> {
+  if (p.provider === 'local') {
+    return engine<Completed>($, ['complete', '--model', p.model], JSON.stringify({ system: p.system, prompt: p.prompt }))
+  }
+  // Through the session's own API client: no child `claude` process, so no
+  // plugins, MCP servers or CLAUDE.md loaded, and no stray session written.
+  const r = await $.model.complete({
+    model: p.model,
+    system: p.system,
+    prompt: p.prompt,
+    effort: p.effort,
+    maxTokens: p.max_output_tokens,
+    timeoutMs: p.timeout_seconds * 1000,
+  })
+  if (r.isAnswered) {
+    const { input_tokens, output_tokens } = r.usage
+    return { ok: true, text: r.text, note: `${input_tokens} in / ${output_tokens} out tokens` }
+  }
+  const error =
+    r.reason === 'api-error'
+      ? `API error (${r.error}${r.status ? `, HTTP ${r.status}` : ''})`
+      : r.reason === 'aborted'
+        ? `timed out or was cancelled (limit ${p.timeout_seconds}s)`
+        : `${p.model} replied with no text`
+  return { ok: false, error }
+}
+
 const FRESH = 'Start a fresh session here with the handoff (runs /clear, pre-fills your prompt)'
 const COPY = 'Copy the handoff to the clipboard'
 const KEEP = 'Neither, just keep the file'
+
+async function startFresh($: EngineInterface, path: string, text: string, auto: boolean) {
+  const previous = await $.session.id()
+  await $.command.run({ command: 'clear' })
+  lastTurnAt = 0
+  const kept = `The previous session is kept: claude --resume ${previous}`
+  if (auto) {
+    // @-mentions are not expanded in a plugin's prompt, so send the handoff itself.
+    $.ui.log(`Continuing in a fresh session from the handoff at ${path}. ${kept}`)
+    await $.prompt.submit({ text, asUser: true })
+    return
+  }
+  // An @-mention typed by the person is expanded into the file's contents on Enter.
+  await $.prompt.fill({ text: `@${path} ` })
+  $.ui.log(`Started fresh from the handoff. ${kept}`)
+  $.ui.toast('Review the prompt and press Enter to continue in the new session.', { timeoutMs: 8000 })
+}
 
 async function offerNextStep($: EngineInterface, path: string, text: string) {
   let choice: string
@@ -79,59 +158,61 @@ async function offerNextStep($: EngineInterface, path: string, text: string) {
     return
   }
 
-  if (choice === FRESH) {
-    const previous = await $.session.id()
-    await $.command.run({ command: 'clear' })
-    lastTurnAt = 0
-    // An @-mention typed by the person is expanded into the file's contents on Enter.
-    await $.prompt.fill({ text: `@${path} ` })
-    $.ui.log(`Started fresh from the handoff. The previous session is kept: claude --resume ${previous}`)
-    $.ui.toast('Review the prompt and press Enter to continue in the new session.', { timeoutMs: 8000 })
-  }
+  if (choice === FRESH) await startFresh($, path, text, false)
 }
 
-async function runHandoff($: EngineInterface, held: string, model?: string) {
+/** `auto`: skip the follow-up question and continue in a fresh session with the handoff. */
+async function runHandoff($: EngineInterface, held: string, auto = false) {
   if (handoffRunning) {
-    $.ui.toast('A local handoff is already being generated.')
+    $.ui.toast('A handoff is already being generated.')
     return
   }
   handoffRunning = true
+  let stage = 'condensing the transcript'
   const started = await $.clock.now()
   const tick = $.clock.every(1000, () => {
     void $.clock.now().then(now => {
-      $.ui.status(`⏳ Local handoff: summarizing with ${model ? shortModel(model) : 'local model'}… ${Math.round((now - started) / 1000)}s`)
+      $.ui.status(`⏳ Handoff: ${stage}… ${Math.round((now - started) / 1000)}s`)
     })
   })
+  let provider: Provider | undefined
+  const fail = async (error: string) => {
+    const hint = provider === 'local' ? "\n  Is LM Studio's server running with a model loaded? (lms server start)" : ''
+    $.ui.log(`✗ Handoff failed: ${error}${hint}`)
+    $.ui.toast('Handoff failed — see the transcript for why.')
+    if (held) await $.prompt.fill({ text: held })
+  }
   try {
     const sessionId = await $.session.id()
     const cwd = await $.session.cwd()
-    const { stdout, stderr } = await $.process.run(
-      ['python3', script($), 'handoff', '--session-id', sessionId, '--cwd', cwd],
-      { stdin: held, timeoutMs: HANDOFF_TIMEOUT_MS },
+    const prepared = await engine<Prepared>($, ['prepare', '--session-id', sessionId, '--cwd', cwd])
+    if (!prepared.ok) return await fail(prepared.error)
+    provider = prepared.provider
+
+    stage = `summarizing with ${describeModel(provider, prepared.model)}`
+    const summary = await summarize($, prepared)
+    if (!summary.ok) return await fail(summary.error)
+
+    const saved = await engine<Saved>(
+      $,
+      ['save', '--session-id', sessionId, '--cwd', cwd, '--provider', provider, '--model', prepared.model],
+      JSON.stringify({ body: summary.text, held }),
     )
-    let result: Handoff
-    try {
-      result = JSON.parse(stdout) as Handoff
-    } catch {
-      result = { ok: false, error: (stderr || stdout).trim().slice(0, 500) || 'no output' }
-    }
-    if (!result.ok) {
-      $.ui.log(`✗ Local handoff failed: ${result.error}\n  Is LM Studio's server running with a model loaded? (lms server start)`)
-      $.ui.toast('Local handoff failed — see the transcript for why.')
-      if (held) await $.prompt.fill({ text: held })
-      return
-    }
+    if (!saved.ok) return await fail(saved.error)
+
     tick.cancel()
     $.ui.status(undefined)
-    $.ui.log(`✓ Handoff ready (${shortModel(result.model)}, ${result.seconds}s): ${result.path}`)
+    const seconds = Math.round(((await $.clock.now()) - started) / 1000)
+    const note = summary.note ? `, ${summary.note}` : ''
+    $.ui.log(`✓ Handoff ready (${shortModel(prepared.model)}, ${seconds}s${note}): ${saved.path}`)
     try {
-      await offerNextStep($, result.path, result.text)
+      if (auto) await startFresh($, saved.path, saved.text, true)
+      else await offerNextStep($, saved.path, saved.text)
     } catch (err) {
-      $.ui.log(`Handoff is saved at ${result.path}, but the follow-up step failed: ${err instanceof Error ? err.message : String(err)}`)
+      $.ui.log(`Handoff is saved at ${saved.path}, but the follow-up step failed: ${err instanceof Error ? err.message : String(err)}`)
     }
   } catch (err) {
-    $.ui.log(`✗ Local handoff failed: ${err instanceof Error ? err.message : String(err)}`)
-    if (held) await $.prompt.fill({ text: held })
+    await fail(err instanceof Error ? err.message : String(err))
   } finally {
     tick.cancel()
     $.ui.status(undefined)
@@ -143,7 +224,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'handoff',
-      description: 'Summarize this session with your local LLM into a handoff for a new session',
+      description: 'Summarize this session into a handoff for a new session (local LLM or Claude, per stale-guard config)',
     })
     return next(e)
   })
@@ -181,17 +262,20 @@ export const register: Register = on => {
     const status = await check($)
     if (!status?.stale) return next(e)
 
-    const model = status.local_model ?? null
-    const handoff = model ? `Generate a handoff prompt using ${shortModel(model)} (local, free)` : null
+    const model = status.handoff_model ?? null
+    const who = model ? describeModel(status.provider, model) : null
+    const handoff = who ? `Generate a handoff prompt using ${who}` : null
+    const autoHandoff =
+      who && status.offer_auto_handoff ? `Generate a handoff using ${who} and continue in a fresh session with it right away` : null
     const send = `Send anyway (re-caches ${kTokens(status.context_tokens)})`
     const hold = "Don't send (put it back in the input box)"
-    const options = handoff ? [handoff, send, hold] : [send, hold]
-    const noLocal = model ? '' : ` (Local handoff unavailable: ${status.local_unavailable_reason ?? 'no local model'}.)`
+    const options = [handoff, autoHandoff, send, hold].filter((o): o is string => o !== null)
+    const unavailable = who ? '' : ` (Handoff unavailable: ${status.handoff_unavailable_reason ?? 'no model'}.)`
     let choice: string
     try {
       choice = await $.ui.ask(
         `This session has been idle ${status.idle_text}, so its prompt cache (~${status.ttl_minutes}m) has ` +
-          `likely expired.${noLocal} What do you want to do with your message?`,
+          `likely expired.${unavailable} What do you want to do with your message?`,
         { header: 'Cold cache', options },
       )
     } catch {
@@ -200,9 +284,14 @@ export const register: Register = on => {
 
     if (choice === send) return next(e)
 
-    if (handoff && model && choice === handoff) {
-      $.clock.after(0, () => void runHandoff($, e.text, model))
-      return { drop: 'Held: generating a local handoff (progress in the status line).' }
+    if (choice === handoff || choice === autoHandoff) {
+      const auto = choice === autoHandoff
+      $.clock.after(0, () => void runHandoff($, e.text, auto))
+      return {
+        drop: auto
+          ? 'Held: generating a handoff, then continuing in a fresh session (progress in the status line).'
+          : 'Held: generating a handoff (progress in the status line).',
+      }
     }
 
     // Anything else (including free text typed under "Other"): give the message back.

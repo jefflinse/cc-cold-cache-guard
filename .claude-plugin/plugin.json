@@ -1,8 +1,8 @@
 {
   "name": "cc-cold-cache-guard",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": {
     "name": "Jeff Linse"
   },
-  "description": "Holds prompts sent to a session whose prompt cache has gone cold, and offers a local-LLM (LM Studio) summary + handoff instead of an expensive full cache write."
+  "description": "Holds prompts sent to a session whose prompt cache has gone cold, and offers a cheap handoff (summarized by a local LLM or a small Claude model) instead of an expensive full cache write."
 }
