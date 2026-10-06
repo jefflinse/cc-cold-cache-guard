@@ -1,0 +1,14 @@
+{
+  "name": "cc-cold-cache-guard",
+  "description": "Single-plugin marketplace for cc-cold-cache-guard.",
+  "owner": {
+    "name": "Jeff Linse"
+  },
+  "plugins": [
+    {
+      "name": "cc-cold-cache-guard",
+      "source": "./",
+      "description": "Holds prompts sent to a session whose prompt cache has gone cold, and offers a local-LLM (LM Studio) summary + handoff instead of an expensive full cache write."
+    }
+  ]
+}
