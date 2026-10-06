@@ -1,6 +1,6 @@
 {
   "name": "cc-cold-cache-guard",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "author": {
     "name": "Jeff Linse"
   },
@@ -9,7 +9,7 @@
     "provider": {
       "type": "string",
       "title": "Handoff provider",
-      "description": "Who summarizes the handoff: Claude through this session's API (anthropic) or a local OpenAI-compatible server such as LM Studio (local).",
+      "description": "Who summarizes the handoff: Claude through this session's API (anthropic) or a local OpenAI-compatible server such as LM Studio (local). Default: anthropic.",
       "options": [
         "anthropic",
         "local"
@@ -19,13 +19,13 @@
     "anthropic_model": {
       "type": "string",
       "title": "Claude model",
-      "description": "Anthropic provider only. An alias (haiku, sonnet, opus) or a full model id.",
+      "description": "Anthropic provider only. An alias (haiku, sonnet, opus) or a full model id. Default: haiku.",
       "default": "haiku"
     },
     "anthropic_effort": {
       "type": "string",
       "title": "Claude effort",
-      "description": "Anthropic provider only. Ignored by models without an effort setting, including Haiku 4.5.",
+      "description": "Anthropic provider only. Ignored by models without an effort setting, including Haiku 4.5. Default: low.",
       "options": [
         "low",
         "medium",
@@ -38,45 +38,45 @@
     "auto_continue_choice": {
       "type": "boolean",
       "title": "Auto-continue choice",
-      "description": "Add a cold-cache option that generates the handoff, runs /clear and sends it right away.",
+      "description": "Add a cold-cache option that generates the handoff, runs /clear and sends it right away. Default: off.",
       "default": false
     },
     "idle_minutes": {
       "type": "string",
       "title": "Idle threshold (minutes)",
-      "description": "Minutes of idleness before a prompt is held. auto = the cache TTL detected from the transcript minus the margin below.",
+      "description": "Minutes of idleness before a prompt is held. auto = the cache TTL detected from the transcript minus the margin below. Default: auto.",
       "default": "auto"
     },
     "auto_margin_minutes": {
       "type": "number",
       "title": "Auto margin (minutes)",
-      "description": "With idle_minutes auto: how many minutes before the cache TTL to start holding prompts.",
+      "description": "With idle_minutes auto: how many minutes before the cache TTL to start holding prompts. Default: 2.",
       "min": 0,
       "default": 2
     },
     "fallback_ttl_minutes": {
       "type": "number",
       "title": "Fallback cache TTL (minutes)",
-      "description": "Cache TTL assumed when the transcript doesn't show one.",
+      "description": "Cache TTL assumed when the transcript doesn't show one. Default: 60.",
       "min": 1,
       "default": 60
     },
     "llm_base_url": {
       "type": "string",
       "title": "Local server URL",
-      "description": "Local provider only. Base URL of the OpenAI-compatible server.",
+      "description": "Local provider only. Base URL of the OpenAI-compatible server. Default: http://localhost:1234.",
       "default": "http://localhost:1234"
     },
     "model": {
       "type": "string",
       "title": "Local model",
-      "description": "Local provider only. Empty = the first loaded model.",
+      "description": "Local provider only. Default: empty, which uses the first loaded model.",
       "default": ""
     },
     "temperature": {
       "type": "number",
       "title": "Local temperature",
-      "description": "Local provider only. Sampling temperature.",
+      "description": "Local provider only. Sampling temperature. Default: 0.2.",
       "min": 0,
       "max": 2,
       "default": 0.2
@@ -84,13 +84,13 @@
     "local_thinking": {
       "type": "boolean",
       "title": "Local model thinking",
-      "description": "Local provider only. Let a reasoning model think before writing the handoff. Off by default: thinking is slow and spends output tokens, and a handoff rarely needs it.",
+      "description": "Local provider only. Let a reasoning model think before writing the handoff. Thinking is slow and spends output tokens, and a handoff rarely needs it. Default: off.",
       "default": false
     },
     "request_timeout_seconds": {
       "type": "number",
       "title": "Request timeout (seconds)",
-      "description": "Limit for the summarizing call; must stay below the hooks module's 10-minute limit.",
+      "description": "Limit for the summarizing call; must stay below the hooks module's 10-minute limit. Default: 540.",
       "min": 10,
       "max": 590,
       "default": 540
@@ -98,7 +98,7 @@
     "max_output_tokens": {
       "type": "number",
       "title": "Max handoff tokens",
-      "description": "Output cap for the handoff. Anthropic caps it at 64000.",
+      "description": "Output cap for the handoff. Anthropic caps it at 64000. Default: 16384.",
       "min": 1024,
       "max": 64000,
       "default": 16384
@@ -106,14 +106,14 @@
     "max_transcript_chars": {
       "type": "number",
       "title": "Max transcript characters",
-      "description": "How much of the condensed transcript is sent to the summarizer (620000 is about 177k tokens). Sized for a 200k-token context; a value that won't fit the model makes the handoff unavailable and says what would.",
+      "description": "How much of the condensed transcript is sent to the summarizer. Sized for a 200k-token context; a value that won't fit the model makes the handoff unavailable and says what would. Default: 620000 (about 177k tokens).",
       "min": 10000,
       "default": 620000
     },
     "handoff_dir": {
       "type": "string",
       "title": "Handoff folder",
-      "description": "Where handoff files are saved.",
+      "description": "Where handoff files are saved. Default: ~/.claude/handoffs.",
       "default": "~/.claude/handoffs"
     }
   }

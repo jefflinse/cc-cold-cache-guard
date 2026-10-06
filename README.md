@@ -29,6 +29,24 @@ The transcript is only ever read; condensing happens on an in-memory copy. Hando
 - **`anthropic`** (default): Claude, called in-process through the session's own API client and credentials (`$.model.complete`). Nothing is spawned and no extra session is recorded. Defaults to `haiku`; Haiku 4.5 has no effort setting, so `anthropic_effort` only matters if you switch to a model that does (e.g. `sonnet`). A handoff takes about 30 seconds with Haiku. The request is uncached, but it only carries the condensed transcript (up to ≈177k tokens at the default `max_transcript_chars`), not the full conversation.
 - **`local`**: LM Studio, or any OpenAI-compatible server, for free handoffs. The handoff options only appear when a model is actually loaded. Load it with a long context (200k tokens fits the default `max_transcript_chars`). A long session can take minutes to read locally, and `request_timeout_seconds` (540) is the limit.
 
+## Install
+
+Requires `python3`.
+
+```sh
+claude plugin install cc-cold-cache-guard \
+  --marketplace https://github.com/jefflinse/cc-cold-cache-guard.git
+```
+
+Then restart Claude Code, or run `/reload-plugins` in an open session. The install notes that the options aren't set; each one falls back to its default, and the settings screen names the defaults. Run `/cold-cache-guard-configure` to see the current values and change them, or set some at install time with `--config`, e.g. `--config provider=local`.
+
+To update:
+
+```sh
+claude plugin marketplace update cc-cold-cache-guard
+claude plugin update cc-cold-cache-guard@cc-cold-cache-guard
+```
+
 ## Try It
 
 Requires `python3`. For the `local` provider, LM Studio's server must also be running (`lms server start`) with a model loaded.

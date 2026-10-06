@@ -176,6 +176,18 @@ class StaleGuardTest(unittest.TestCase):
         defaults = json.loads((ROOT / "config.json").read_text())
         self.assertEqual({k: f["default"] for k, f in manifest["userConfig"].items()}, defaults)
 
+    def test_manifest_descriptions_state_the_defaults(self):
+        # The settings screen shows an unsaved field as empty, so the help text names its default.
+        manifest = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text())
+        for key, field in manifest["userConfig"].items():
+            default = field["default"]
+            if isinstance(default, bool):
+                shown = "on" if default else "off"
+            else:
+                shown = str(default) or "empty"
+            with self.subTest(key=key):
+                self.assertIn(f"Default: {shown}", field["description"])
+
     def test_check_transcript_limit_too_big_for_haiku_says_why(self):
         self.configure(provider="anthropic", max_transcript_chars=1_000_000, max_output_tokens=20000)
         out = self.run_cmd("check", "--session-id", SESSION)
