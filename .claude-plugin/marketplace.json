@@ -8,6 +8,7 @@
     {
       "name": "cc-cold-cache-guard",
       "source": "./",
+      "version": "0.2.0",
       "description": "Holds prompts sent to a session whose prompt cache has gone cold, and offers a cheap handoff (summarized by a local LLM or a small Claude model) instead of an expensive full cache write."
     }
   ]
