@@ -13,12 +13,21 @@ When you send a message to a cold session, the message is held and Claude Code's
 
 It also adds a `/handoff` command for generating a handoff any time, a `/cold-cache-guard-configure` command that lists the current settings and opens the plugin's settings screen, and shows a toast when you `--resume` a cold session.
 
+A handoff has four parts:
+
+1. **Original request**, quoted verbatim: your first message in the session. A session started from a handoff carries that handoff's original request forward.
+2. **The summary**: goal, decisions, current state, files, open questions and next steps.
+3. **Last exchanges**, quoted verbatim: your last three messages and Claude's final reply to each.
+4. **Your held message**, if there is one.
+
+Quoted messages are text only, without tool calls or the slash and `!` commands you ran, and each is capped at 4,000 characters. The summarizer still sees the whole condensed transcript.
+
 The transcript is only ever read; condensing happens on an in-memory copy. Handoffs are saved to `~/.claude/handoffs/`.
 
 ## Providers
 
-- **`anthropic`** (default): Claude, called in-process through the session's own API client and credentials (`$.model.complete`). Nothing is spawned and no extra session is recorded. Defaults to `haiku`; Haiku 4.5 has no effort setting, so `anthropic_effort` only matters if you switch to a model that does (e.g. `sonnet`). A handoff takes about 30 seconds with Haiku. The request is uncached, but it only carries the condensed transcript (≈25k tokens at the default `max_transcript_chars`), not the full conversation.
-- **`local`**: LM Studio, or any OpenAI-compatible server, for free handoffs. The handoff options only appear when a model is actually loaded.
+- **`anthropic`** (default): Claude, called in-process through the session's own API client and credentials (`$.model.complete`). Nothing is spawned and no extra session is recorded. Defaults to `haiku`; Haiku 4.5 has no effort setting, so `anthropic_effort` only matters if you switch to a model that does (e.g. `sonnet`). A handoff takes about 30 seconds with Haiku. The request is uncached, but it only carries the condensed transcript (up to ≈177k tokens at the default `max_transcript_chars`), not the full conversation.
+- **`local`**: LM Studio, or any OpenAI-compatible server, for free handoffs. The handoff options only appear when a model is actually loaded. Load it with a long context (200k tokens fits the default `max_transcript_chars`). A long session can take minutes to read locally, and `request_timeout_seconds` (540) is the limit.
 
 ## Try It
 
@@ -57,7 +66,7 @@ Settings are layered, each layer winning over the ones before it:
 | `temperature` | `0.2` | Local only |
 | `anthropic_model` | `"haiku"` | Anthropic only. An alias or full model id, as `--model` takes. Env: `STALE_GUARD_ANTHROPIC_MODEL` |
 | `anthropic_effort` | `"low"` | Anthropic only. `low`, `medium`, `high`, `xhigh` or `max`; ignored by models without an effort setting, including Haiku 4.5. Env: `STALE_GUARD_ANTHROPIC_EFFORT` |
-| `max_transcript_chars` | `100000` | ≈25k tokens; keep it under your model's context length. With a Haiku model, a value that can't fit its 200k-token context (with `max_output_tokens`) makes the handoff unavailable and says what would fit (about 630000 at the default output size). Env: `STALE_GUARD_MAX_CHARS` |
+| `max_transcript_chars` | `620000` | ≈177k tokens, sized for a 200k-token context with room for the summarizer's instructions and `max_output_tokens`. Checked against the model: Haiku's 200k, a local model's loaded context as LM Studio reports it, or 200k when the server doesn't say. A value that won't fit makes the handoff unavailable and says what would. The 1M-token Claude models aren't checked. Env: `STALE_GUARD_MAX_CHARS` |
 | `max_output_tokens` | `16384` | Reasoning models spend part of this on hidden thinking. Anthropic caps it at 64000 |
 | `request_timeout_seconds` | `540` | Must stay below the hooks module's 10-minute limit |
 | `handoff_dir` | `~/.claude/handoffs` | |

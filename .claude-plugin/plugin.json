@@ -1,6 +1,6 @@
 {
   "name": "cc-cold-cache-guard",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "author": {
     "name": "Jeff Linse"
   },
@@ -100,9 +100,9 @@
     "max_transcript_chars": {
       "type": "number",
       "title": "Max transcript characters",
-      "description": "How much of the condensed transcript is sent to the summarizer (100000 is about 25k tokens).",
+      "description": "How much of the condensed transcript is sent to the summarizer (620000 is about 177k tokens). Sized for a 200k-token context; a value that won't fit the model makes the handoff unavailable and says what would.",
       "min": 10000,
-      "default": 100000
+      "default": 620000
     },
     "handoff_dir": {
       "type": "string",

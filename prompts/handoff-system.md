@@ -19,6 +19,7 @@ The new session will read your handoff and nothing else from this conversation (
 4. Preserve user preferences and instructions that should keep applying (style rules, things they said never/always to do, approval requirements), quoted briefly where wording matters.
 5. Leave out chit-chat, dead ends that no longer matter, raw tool output, and the assistant's internal deliberation — unless a dead end explains why the current approach was chosen.
 6. Write to the next assistant in second person ("You are continuing…"). Plain Markdown. No preamble before the first heading, no closing remarks after the last section.
+7. The handoff will also quote, verbatim, the user's first request (above your sections) and the last three exchanges (below them). Don't copy those; summarize what happened, and refer to them where it helps ("as asked in the original request", "see the last exchange").
 
 ## Output format
 

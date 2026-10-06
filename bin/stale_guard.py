@@ -304,6 +304,76 @@ def condense(transcript_path, max_chars):
     return "\n".join(head + [f"[… {omitted} entries omitted …]"] + tail)
 
 
+# ---------------------------------------------------------------- verbatim exchanges
+
+HANDOFF_TITLE = "# Handoff from a previous Claude Code session"
+ORIGINAL_HEADING = "## Original request (verbatim)"
+LAST_HEADING = "## Last exchanges (verbatim)"
+# Echoes of slash commands and `!` shell commands: things the person ran, not wrote.
+COMMAND_ECHOES = ("<command-name>", "<command-message>", "<local-command-", "<bash-input>", "<bash-stdout>", "<bash-stderr>")
+ACTION = object()
+VERBATIM_CHARS = 4000  # per message, so one giant paste can't swamp the handoff
+TAIL_EXCHANGES = 3
+
+
+def typed_text(entry):
+    """What the person typed in a user entry; ACTION for a command they ran; None for tool results and meta rows."""
+    if entry.get("isSidechain") or entry.get("isMeta") or entry.get("isCompactSummary"):
+        return None
+    content = (entry.get("message") or {}).get("content")
+    if isinstance(content, list):
+        if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+            return None
+        content = block_text(content)
+    text = REMINDER_RE.sub("", content or "").strip()
+    if not text:
+        return None
+    return ACTION if text.startswith(COMMAND_ECHOES) else text
+
+
+def exchanges(transcript_path):
+    """[user text, the assistant's final text reply or ""] per typed message, from the whole file.
+
+    Compaction doesn't matter here: the entries before a compact boundary are still in
+    the file, so the first exchange is the session's real first one.
+    """
+    out = []
+    for e in iter_entries(transcript_path):
+        if e.get("type") == "user":
+            text = typed_text(e)
+            if text is not None:
+                out.append([text, ""])  # an ACTION ends the exchange before it, so a reply to it isn't misfiled
+        elif e.get("type") == "assistant" and out and not e.get("isSidechain"):
+            content = (e.get("message") or {}).get("content")
+            for b in content if isinstance(content, list) else []:
+                if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip():
+                    out[-1][1] = b["text"].strip()  # the last one in the turn: its answer, not the narration
+    return [ex for ex in out if ex[0] is not ACTION]
+
+
+def quote(text):
+    return "\n".join(f"> {line}" if line.strip() else ">" for line in clip(text, VERBATIM_CHARS).splitlines())
+
+
+def original_request_section(first_message):
+    """The verbatim first request, as a Markdown section, or "" when there's nothing to quote."""
+    if not first_message.startswith(HANDOFF_TITLE):
+        return f"{ORIGINAL_HEADING}\n\n{quote(first_message)}\n\n"
+    # A session started from a handoff: carry that handoff's original request forward as is.
+    m = re.search(rf"^{re.escape(ORIGINAL_HEADING)}\n\n(.*?)\n*(?=^## |\Z)", first_message, re.S | re.M)
+    return f"{ORIGINAL_HEADING}\n\n{m.group(1)}\n\n" if m else ""
+
+
+def last_exchanges_section(tail):
+    parts = []
+    for user, reply in tail:
+        part = f"**User:**\n\n{quote(user)}"
+        if reply:
+            part += f"\n\n**Assistant:**\n\n{quote(reply)}"
+        parts.append(part)
+    return f"\n\n{LAST_HEADING}\n\n" + "\n\n---\n\n".join(parts) if parts else ""
+
+
 # ---------------------------------------------------------------- local LLM
 
 def http_json(url, payload=None, timeout=10):
@@ -314,10 +384,11 @@ def http_json(url, payload=None, timeout=10):
 
 
 def probe_model(cfg, timeout=1.5):
-    """Return (model_id, None) if a usable model is available, else (None, reason).
+    """Return (model_id, None, context_tokens) if a usable model is available, else (None, reason, None).
 
-    Prefers LM Studio's native API, which says which models are loaded; falls back
-    to the OpenAI-compatible /v1/models for other servers (llama.cpp, Ollama, ...).
+    Prefers LM Studio's native API, which says which models are loaded and with what
+    context length; falls back to the OpenAI-compatible /v1/models for other servers
+    (llama.cpp, Ollama, ...), which say neither, so context_tokens is None there.
     """
     base = cfg["llm_base_url"].rstrip("/")
     wanted = cfg.get("model") or ""
@@ -325,24 +396,27 @@ def probe_model(cfg, timeout=1.5):
         models = http_json(f"{base}/api/v0/models", timeout=timeout).get("data", [])
         llms = [m for m in models if m.get("type") in (None, "llm", "vlm")]
         if wanted:
-            if any(m.get("id") == wanted for m in llms):
-                return wanted, None
-            return None, f"configured model {wanted} is not available in LM Studio"
-        loaded = [m["id"] for m in llms if m.get("state") == "loaded"]
-        return (loaded[0], None) if loaded else (None, "LM Studio is running but no model is loaded")
+            found = next((m for m in llms if m.get("id") == wanted), None)
+            if found:
+                return wanted, None, found.get("loaded_context_length")  # absent until it's loaded
+            return None, f"configured model {wanted} is not available in LM Studio", None
+        loaded = [m for m in llms if m.get("state") == "loaded"]
+        if loaded:
+            return loaded[0]["id"], None, loaded[0].get("loaded_context_length")
+        return None, "LM Studio is running but no model is loaded", None
     except urllib.error.HTTPError:
         pass  # not LM Studio; try the generic endpoint
     except (urllib.error.URLError, TimeoutError, OSError):
-        return None, f"no local LLM server at {base}"
+        return None, f"no local LLM server at {base}", None
     except ValueError:
         pass
     try:
         ids = [m.get("id") for m in http_json(f"{base}/v1/models", timeout=timeout).get("data", [])]
     except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
-        return None, f"no local LLM server at {base} ({exc})"
+        return None, f"no local LLM server at {base} ({exc})", None
     if wanted:
-        return (wanted, None) if wanted in ids else (None, f"configured model {wanted} is not served at {base}")
-    return (ids[0], None) if ids else (None, f"the server at {base} has no models")
+        return (wanted, None, None) if wanted in ids else (None, f"configured model {wanted} is not served at {base}", None)
+    return (ids[0], None, None) if ids else (None, f"the server at {base} has no models", None)
 
 
 def run_local_llm(cfg, model, system_prompt, user_content):
@@ -372,27 +446,29 @@ def run_local_llm(cfg, model, system_prompt, user_content):
 PROVIDERS = ("local", "anthropic")
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
-# Haiku 4.5's context window, which has to hold the prompt and the reply. The other
-# current Claude models take 1M tokens, more than any sensible max_transcript_chars.
-HAIKU_CONTEXT_TOKENS = 200_000
+# The context window a handoff is sized for, which has to hold the prompt and the
+# reply: Haiku 4.5's, and what a local model is assumed to have when its server
+# doesn't say (most current MoE models take this much). The other current Claude
+# models take 1M tokens, more than any sensible max_transcript_chars.
+DEFAULT_CONTEXT_TOKENS = 200_000
 # Transcripts full of code and paths run denser than prose's ~4; err towards more tokens.
 CHARS_PER_TOKEN = 3.5
 
 
-def haiku_overflow(cfg, model):
-    """Why the configured sizes can't fit a Haiku model's context, or None."""
-    if "haiku" not in model.lower():
-        return None
-    chars = int(cfg.get("max_transcript_chars", 100000))
+def context_overflow(cfg, model, context_tokens, fix):
+    """Why the configured sizes can't fit the model's context, or None. `fix` ends the advice."""
+    chars = int(cfg.get("max_transcript_chars", 620000))
     system_chars = len((PLUGIN_ROOT / "prompts" / "handoff-system.md").read_text())
     output = int(cfg.get("max_output_tokens", 16384))
     needed = (chars + system_chars) / CHARS_PER_TOKEN + output
-    if needed <= HAIKU_CONTEXT_TOKENS:
+    if needed <= context_tokens:
         return None
-    fits = int((HAIKU_CONTEXT_TOKENS - output) * CHARS_PER_TOKEN - system_chars) // 10_000 * 10_000
+    window = f"{model}'s {round(context_tokens / 1000)}k-token context"
+    fits = int((context_tokens - output) * CHARS_PER_TOKEN - system_chars) // 10_000 * 10_000
+    if fits <= 0:
+        return f"max_output_tokens {output} leaves no room for the transcript in {window}; lower it, or {fix}"
     return (f"max_transcript_chars {chars} (~{round(chars / CHARS_PER_TOKEN / 1000)}k tokens) plus "
-            f"max_output_tokens {output} won't fit {model}'s 200k-token context; "
-            f"set max_transcript_chars to {fits} or less, or use a bigger model")
+            f"max_output_tokens {output} won't fit {window}; set max_transcript_chars to {fits} or less, or {fix}")
 
 
 def provider_of(cfg):
@@ -411,11 +487,18 @@ def handoff_backend(cfg, timeout=1.5):
         if effort not in EFFORTS:
             return provider, None, f"anthropic_effort must be one of {', '.join(EFFORTS)}, not {effort!r}"
         model = cfg.get("anthropic_model") or "haiku"
-        overflow = haiku_overflow(cfg, model)
-        return (provider, None, overflow) if overflow else (provider, model, None)
+        if "haiku" in model.lower():
+            overflow = context_overflow(cfg, model, DEFAULT_CONTEXT_TOKENS, "use a bigger model")
+            if overflow:
+                return provider, None, overflow
+        return provider, model, None
     if provider == "local":
-        model, reason = probe_model(cfg, timeout=timeout)
-        return provider, model, reason
+        model, reason, context = probe_model(cfg, timeout=timeout)
+        if not model:
+            return provider, None, reason
+        overflow = context_overflow(cfg, model, context or DEFAULT_CONTEXT_TOKENS,
+                                    "load the model with a longer context")
+        return (provider, None, overflow) if overflow else (provider, model, None)
     return provider, None, f"provider must be one of {', '.join(PROVIDERS)}, not {provider!r}"
 
 
@@ -459,7 +542,7 @@ def cmd_prepare(cfg, args):
 
     last_ts, _, _ = session_activity(transcript)
     idle_note = fmt_duration((datetime.now(timezone.utc) - last_ts).total_seconds() / 60) + " ago" if last_ts else "unknown"
-    condensed = condense(transcript, int(cfg.get("max_transcript_chars", 100000)))
+    condensed = condense(transcript, int(cfg.get("max_transcript_chars", 620000)))
     return {
         "ok": True,
         "provider": provider,
@@ -493,14 +576,23 @@ def cmd_save(cfg, args):
     if not body:
         return {"ok": False, "error": "the model's handoff was empty"}
     transcript = find_transcript(args.session_id)
+    exs = exchanges(transcript) if transcript else []
+    original = original_request_section(exs[0][0]) if exs else ""
+    # Never the first exchange: it's quoted above, or it's the handoff this session started from.
+    tail = exs[max(1, len(exs) - TAIL_EXCHANGES):]
+    quoted = " and ".join(p for p, has in (("the original request", original), ("the last exchanges", tail)) if has)
+    verbatim = f"{quoted[0].upper()}{quoted[1:]} are quoted verbatim; the rest is a summary. " if quoted else ""
     handoff = (
-        "# Handoff from a previous Claude Code session\n\n"
+        f"{HANDOFF_TITLE}\n\n"
         f"You are continuing work from an earlier Claude Code session in `{args.cwd}` that was summarized by "
-        f"{summarizer_label(args.provider, args.model)} to avoid re-reading its full history. Treat this as your "
-        "working context, but verify file and repo state before relying on specifics.\n\n"
+        f"{summarizer_label(args.provider, args.model)} to avoid re-reading its full history. {verbatim}Treat this "
+        "as your working context, but verify file and repo state before relying on specifics.\n\n"
         + (f"If you need an exact detail, the full original transcript is at `{transcript}` "
            "(JSONL, read-only — search it rather than reading it whole).\n\n" if transcript else "")
-        + body + "\n"
+        + original
+        + body
+        + last_exchanges_section(tail)
+        + "\n"
     )
     if held:
         handoff += f"\n## The user's next message\n\n{held}\n"

@@ -9,8 +9,10 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -30,6 +32,36 @@ def transcript_lines(idle_minutes):
                       "cache_creation": {"ephemeral_1h_input_tokens": 5000}},
         }},
     ]
+
+
+def user(text, **extra):
+    return {"type": "user", "message": {"role": "user", "content": text}, **extra}
+
+
+def assistant(*blocks):
+    return {"type": "assistant", "message": {"role": "assistant", "content": list(blocks)}}
+
+
+def text(t):
+    return {"type": "text", "text": t}
+
+
+def fake_lm_studio(models):
+    """An LM Studio stand-in answering /api/v0/models; returns (base_url, server)."""
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps({"data": models}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{server.server_address[1]}", server
 
 
 class StaleGuardTest(unittest.TestCase):
@@ -112,7 +144,7 @@ class StaleGuardTest(unittest.TestCase):
         self.assertEqual(got["provider"], ("local", "/config"))
         self.assertEqual(got["anthropic_model"], ("opus", "STALE_GUARD_ANTHROPIC_MODEL"))
         self.assertEqual(got["anthropic_effort"], ("low", "default"))  # set, but to the default
-        self.assertEqual(got["max_transcript_chars"], (100000, "default"))  # not passed at all
+        self.assertEqual(got["max_transcript_chars"], (620000, "default"))  # not passed at all
 
     def test_config_local_url_without_scheme_gets_http(self):
         self.configure(llm_base_url="localhost:1234")
@@ -135,6 +167,28 @@ class StaleGuardTest(unittest.TestCase):
         self.assertIsNone(out["handoff_model"])
         self.assertIn("won't fit haiku's 200k-token context", out["handoff_unavailable_reason"])
         self.assertIn("set max_transcript_chars to 620000 or less", out["handoff_unavailable_reason"])
+
+    def lm_studio(self, **model):
+        url, server = fake_lm_studio([{"id": "gemma", "type": "llm", "state": "loaded", **model}])
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)  # cleanups run last-in first-out
+        return url
+
+    def test_check_local_uses_the_loaded_context_length(self):
+        self.configure(provider="local", llm_base_url=self.lm_studio(loaded_context_length=32768))
+        out = self.run_cmd("check", "--session-id", SESSION)
+        self.assertIsNone(out["handoff_model"])
+        self.assertIn("won't fit gemma's 33k-token context", out["handoff_unavailable_reason"])
+        self.assertIn("or load the model with a longer context", out["handoff_unavailable_reason"])
+
+    def test_check_local_default_fits_a_200k_context(self):
+        self.configure(provider="local", llm_base_url=self.lm_studio(loaded_context_length=226304))
+        self.assertEqual(self.run_cmd("check", "--session-id", SESSION)["handoff_model"], "gemma")
+
+    def test_check_local_assumes_200k_when_the_server_doesnt_say(self):
+        self.configure(provider="local", llm_base_url=self.lm_studio(), max_transcript_chars=800_000)
+        out = self.run_cmd("check", "--session-id", SESSION)
+        self.assertIn("won't fit gemma's 200k-token context", out["handoff_unavailable_reason"])
 
     def test_check_big_transcript_limit_is_fine_for_a_1m_model(self):
         self.configure(provider="anthropic", anthropic_model="sonnet", max_transcript_chars=1_000_000)
@@ -193,6 +247,57 @@ class StaleGuardTest(unittest.TestCase):
         self.assertIn("summarized by Claude (haiku)", out["text"])
         self.assertIn(str(self.transcript), out["text"])
         self.assertTrue(out["text"].endswith("## Goal\nShip it.\n\n## The user's next message\n\nnow run the tests\n"))
+
+    def write_entries(self, entries):
+        self.transcript.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+
+    def save(self, held=""):
+        out = self.run_cmd("save", "--session-id", SESSION, "--cwd", "/repo", "--provider", "anthropic",
+                           "--model", "haiku", stdin=json.dumps({"body": "## Goal\nShip it.", "held": held}))
+        self.assertTrue(out["ok"], out)
+        return out["text"]
+
+    def test_save_quotes_the_original_request_and_last_three_exchanges(self):
+        self.write_entries([
+            user("Build a CLI.\n\n## Not a heading"),
+            assistant(text("Let me look."), {"type": "tool_use", "id": "t1", "name": "Read", "input": {}}),
+            user([{"type": "tool_result", "tool_use_id": "t1", "content": "file contents"}]),
+            assistant(text("Built it.")),
+            user("second ask"), assistant(text("second reply")),
+            user("<command-name>/reload-plugins</command-name>"), assistant(text("reply to a command")),
+            user("<local-command-caveat>…</local-command-caveat>", isMeta=True),
+            user("third ask"), assistant(text("third reply")),
+            user("<bash-input>git push</bash-input>"),
+            user("fourth ask"), assistant(text("fourth reply")),
+            user("fifth ask <system-reminder>hidden</system-reminder>"), assistant(text("fifth reply")),
+        ])
+        handoff = self.save(held="next")
+        self.assertIn("The original request and the last exchanges are quoted verbatim", handoff)
+        original, rest = handoff.split("## Original request (verbatim)\n\n")[1].split("## Goal")
+        self.assertEqual(original, "> Build a CLI.\n>\n> ## Not a heading\n\n")
+        last = rest.split("## Last exchanges (verbatim)\n\n")[1]
+        self.assertEqual(last, (
+            "**User:**\n\n> third ask\n\n**Assistant:**\n\n> third reply\n\n---\n\n"
+            "**User:**\n\n> fourth ask\n\n**Assistant:**\n\n> fourth reply\n\n---\n\n"
+            "**User:**\n\n> fifth ask\n\n**Assistant:**\n\n> fifth reply\n\n"
+            "## The user's next message\n\nnext\n"))
+        for absent in ("second ask", "reply to a command", "git push", "hidden", "Let me look."):
+            self.assertNotIn(absent, handoff)
+
+    def test_save_clips_long_messages(self):
+        self.write_entries([user("x" * 10_000), assistant(text("ok"))])
+        handoff = self.save()
+        self.assertIn("…[6000 chars trimmed]…", handoff)
+        self.assertNotIn("## Last exchanges", handoff)  # the only exchange is the original request
+
+    def test_save_carries_the_original_request_through_a_chain_of_handoffs(self):
+        previous = ("# Handoff from a previous Claude Code session\n\nIntro.\n\n"
+                    "## Original request (verbatim)\n\n> Build a CLI.\n\n## Goal\nOld goal.\n")
+        self.write_entries([user(previous), assistant(text("Got it.")), user("now add tests"), assistant(text("Added."))])
+        handoff = self.save()
+        self.assertEqual(handoff.count("## Original request (verbatim)\n\n> Build a CLI.\n\n## Goal\nShip it."), 1)
+        self.assertNotIn("Old goal", handoff)
+        self.assertIn("**User:**\n\n> now add tests\n\n**Assistant:**\n\n> Added.", handoff)
 
     def test_save_local_names_the_local_model(self):
         out = self.run_cmd("save", "--session-id", SESSION, "--cwd", "/repo", "--provider", "local",

@@ -16,6 +16,6 @@
   "request_timeout_seconds": 540,
   "max_output_tokens": 16384,
 
-  "max_transcript_chars": 100000,
+  "max_transcript_chars": 620000,
   "handoff_dir": "~/.claude/handoffs"
 }
