@@ -64,6 +64,7 @@ Settings are layered, each layer winning over the ones before it:
 | `llm_base_url` | `http://localhost:1234` | Local only. Env: `STALE_GUARD_LLM_URL` |
 | `model` | `""` | Local only. Empty = first loaded model. Env: `STALE_GUARD_MODEL` |
 | `temperature` | `0.2` | Local only |
+| `local_thinking` | `false` | Local only. Off asks the server to skip a reasoning model's thinking (`reasoning_effort: "none"`, which LM Studio honors, plus `chat_template_kwargs.enable_thinking: false` for llama.cpp and vLLM), and retries without them if the server rejects them. On sends neither, so the server's own setting applies |
 | `anthropic_model` | `"haiku"` | Anthropic only. An alias or full model id, as `--model` takes. Env: `STALE_GUARD_ANTHROPIC_MODEL` |
 | `anthropic_effort` | `"low"` | Anthropic only. `low`, `medium`, `high`, `xhigh` or `max`; ignored by models without an effort setting, including Haiku 4.5. Env: `STALE_GUARD_ANTHROPIC_EFFORT` |
 | `max_transcript_chars` | `620000` | ≈177k tokens, sized for a 200k-token context with room for the summarizer's instructions and `max_output_tokens`. Checked against the model: Haiku's 200k, a local model's loaded context as LM Studio reports it, or 200k when the server doesn't say. A value that won't fit makes the handoff unavailable and says what would. The 1M-token Claude models aren't checked. Env: `STALE_GUARD_MAX_CHARS` |

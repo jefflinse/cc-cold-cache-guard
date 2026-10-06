@@ -9,6 +9,7 @@
   "llm_base_url": "http://localhost:1234",
   "model": "",
   "temperature": 0.2,
+  "local_thinking": false,
 
   "anthropic_model": "haiku",
   "anthropic_effort": "low",

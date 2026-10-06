@@ -1,6 +1,6 @@
 {
   "name": "cc-cold-cache-guard",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "author": {
     "name": "Jeff Linse"
   },
@@ -80,6 +80,12 @@
       "min": 0,
       "max": 2,
       "default": 0.2
+    },
+    "local_thinking": {
+      "type": "boolean",
+      "title": "Local model thinking",
+      "description": "Local provider only. Let a reasoning model think before writing the handoff. Off by default: thinking is slow and spends output tokens, and a handoff rarely needs it.",
+      "default": false
     },
     "request_timeout_seconds": {
       "type": "number",

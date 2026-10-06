@@ -419,6 +419,12 @@ def probe_model(cfg, timeout=1.5):
     return (ids[0], None, None) if ids else (None, f"the server at {base} has no models", None)
 
 
+# There's no standard switch for a model's thinking. LM Studio honors reasoning_effort, as
+# OpenAI's own API does; llama.cpp and vLLM read the chat template's enable_thinking flag.
+# A server that doesn't know a field ignores it; a strict one is asked again without them.
+NO_THINKING = {"reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": False}}
+
+
 def run_local_llm(cfg, model, system_prompt, user_content):
     body = {
         "model": model,
@@ -427,8 +433,17 @@ def run_local_llm(cfg, model, system_prompt, user_content):
         "max_tokens": int(cfg.get("max_output_tokens", 4096)),
         "stream": False,
     }
-    resp = http_json(f"{cfg['llm_base_url'].rstrip('/')}/v1/chat/completions", body,
-                     timeout=float(cfg.get("request_timeout_seconds", 840)))
+    url = f"{cfg['llm_base_url'].rstrip('/')}/v1/chat/completions"
+    timeout = float(cfg.get("request_timeout_seconds", 840))
+    if as_bool(cfg.get("local_thinking", False)):
+        resp = http_json(url, body, timeout=timeout)
+    else:
+        try:
+            resp = http_json(url, {**body, **NO_THINKING}, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (400, 422):
+                raise
+            resp = http_json(url, body, timeout=timeout)
     choice = resp["choices"][0]
     text = choice["message"].get("content") or ""
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()  # reasoning models

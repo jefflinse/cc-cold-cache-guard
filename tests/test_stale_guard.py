@@ -46,20 +46,35 @@ def text(t):
     return {"type": "text", "text": t}
 
 
-def fake_lm_studio(models):
-    """An LM Studio stand-in answering /api/v0/models; returns (base_url, server)."""
+def fake_lm_studio(models, strict=False):
+    """An LM Studio stand-in: /api/v0/models, and /v1/chat/completions recording each request in
+    `server.requests`. `strict` rejects fields it doesn't know with a 400, as some servers do.
+    Returns (base_url, server)."""
+    known = {"model", "messages", "temperature", "max_tokens", "stream"}
+
     class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            body = json.dumps({"data": models}).encode()
-            self.send_response(200)
+        def reply(self, code, payload):
+            body = json.dumps(payload).encode()
+            self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(body)
+
+        def do_GET(self):
+            self.reply(200, {"data": models})
+
+        def do_POST(self):
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            server.requests.append(request)
+            if strict and set(request) - known:
+                return self.reply(400, {"error": f"unknown fields: {sorted(set(request) - known)}"})
+            self.reply(200, {"choices": [{"message": {"content": "## Goal\nShip it."}, "finish_reason": "stop"}]})
 
         def log_message(self, *args):
             pass
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.requests = []
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return f"http://127.0.0.1:{server.server_address[1]}", server
 
@@ -168,10 +183,11 @@ class StaleGuardTest(unittest.TestCase):
         self.assertIn("won't fit haiku's 200k-token context", out["handoff_unavailable_reason"])
         self.assertIn("set max_transcript_chars to 620000 or less", out["handoff_unavailable_reason"])
 
-    def lm_studio(self, **model):
-        url, server = fake_lm_studio([{"id": "gemma", "type": "llm", "state": "loaded", **model}])
+    def lm_studio(self, strict=False, **model):
+        url, server = fake_lm_studio([{"id": "gemma", "type": "llm", "state": "loaded", **model}], strict=strict)
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)  # cleanups run last-in first-out
+        self.server = server
         return url
 
     def test_check_local_uses_the_loaded_context_length(self):
@@ -234,6 +250,30 @@ class StaleGuardTest(unittest.TestCase):
         out = self.run_cmd("complete", "--model", "m", stdin=json.dumps({"system": "s", "prompt": "p"}))
         self.assertFalse(out["ok"])
         self.assertIn(NO_SERVER, out["error"])
+
+    def complete(self):
+        out = self.run_cmd("complete", "--model", "gemma", stdin=json.dumps({"system": "s", "prompt": "p"}))
+        self.assertEqual(out, {"ok": True, "text": "## Goal\nShip it."})
+        return self.server.requests
+
+    def test_complete_asks_the_local_model_not_to_think(self):
+        self.configure(provider="local", llm_base_url=self.lm_studio())
+        [request] = self.complete()
+        self.assertEqual(request["reasoning_effort"], "none")
+        self.assertEqual(request["chat_template_kwargs"], {"enable_thinking": False})
+
+    def test_complete_retries_without_the_switches_when_a_server_rejects_them(self):
+        self.configure(provider="local", llm_base_url=self.lm_studio(strict=True))
+        first, second = self.complete()
+        self.assertIn("reasoning_effort", first)
+        self.assertNotIn("reasoning_effort", second)
+        self.assertNotIn("chat_template_kwargs", second)
+
+    def test_complete_with_local_thinking_on_leaves_it_to_the_server(self):
+        self.configure(provider="local", llm_base_url=self.lm_studio(), local_thinking=True)
+        [request] = self.complete()
+        self.assertNotIn("reasoning_effort", request)
+        self.assertNotIn("chat_template_kwargs", request)
 
     # ------------------------------------------------------------ save
 
