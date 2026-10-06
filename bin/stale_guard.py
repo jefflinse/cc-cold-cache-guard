@@ -6,8 +6,8 @@ for the Anthropic provider, the model call itself ($.model.complete):
 
     stale_guard.py check   --session-id ID
         -> {"stale", "idle_minutes", "threshold_minutes", "ttl_minutes", "context_tokens", "transcript",
-            "provider", "handoff_model", "handoff_unavailable_reason", "offer_auto_handoff"}
-           (the handoff_* and offer_* keys only when stale)
+            "provider", "handoff_model", "handoff_unavailable_reason", "auto_continue_choice"}
+           (the handoff_* and auto_continue_choice keys only when stale)
     stale_guard.py prepare --session-id ID --cwd DIR
         -> {"ok": true, "provider", "model", "effort", "max_output_tokens", "timeout_seconds",
             "system", "prompt", "condensed_chars"}
@@ -15,6 +15,11 @@ for the Anthropic provider, the model call itself ($.model.complete):
         -> {"ok": true, "text"}
     stale_guard.py save --session-id ID --cwd DIR --provider P --model M   ({"body", "held"} JSON on stdin)
         -> {"ok": true, "path", "text"}
+    stale_guard.py config
+        -> {"ok": true, "settings": [{"key", "value", "source"}]}
+
+Settings come from config.json, then the plugin's /config values
+($STALE_GUARD_PLUGIN_OPTIONS, JSON), then STALE_GUARD_* env vars.
 
 Every command answers {"ok": false, "error"} on failure.
 
@@ -34,29 +39,50 @@ from pathlib import Path
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
-USER_CONFIG = CLAUDE_DIR / "stale-guard.json"
 
 
 # ---------------------------------------------------------------- config
 
-def load_config():
-    cfg = {}
-    for path in (PLUGIN_ROOT / "config.json", USER_CONFIG):
-        if path.is_file():
-            cfg.update(json.loads(path.read_text()))
-    env = {
-        "STALE_GUARD_IDLE_MINUTES": "idle_minutes",
-        "STALE_GUARD_LLM_URL": "llm_base_url",
-        "STALE_GUARD_MODEL": "model",
-        "STALE_GUARD_MAX_CHARS": "max_transcript_chars",
-        "STALE_GUARD_PROVIDER": "provider",
-        "STALE_GUARD_ANTHROPIC_MODEL": "anthropic_model",
-        "STALE_GUARD_ANTHROPIC_EFFORT": "anthropic_effort",
-    }
-    for var, key in env.items():
+# The hooks module passes the plugin's /config values (its userConfig options) here as JSON.
+OPTIONS_ENV = "STALE_GUARD_PLUGIN_OPTIONS"
+
+ENV_OVERRIDES = {
+    "STALE_GUARD_IDLE_MINUTES": "idle_minutes",
+    "STALE_GUARD_LLM_URL": "llm_base_url",
+    "STALE_GUARD_MODEL": "model",
+    "STALE_GUARD_MAX_CHARS": "max_transcript_chars",
+    "STALE_GUARD_PROVIDER": "provider",
+    "STALE_GUARD_ANTHROPIC_MODEL": "anthropic_model",
+    "STALE_GUARD_ANTHROPIC_EFFORT": "anthropic_effort",
+}
+
+
+def load_config_sources():
+    """Each setting as (value, where it came from). Later layers win: config.json,
+    /config, then STALE_GUARD_* env vars."""
+    defaults_path = PLUGIN_ROOT / "config.json"
+    defaults = json.loads(defaults_path.read_text()) if defaults_path.is_file() else {}
+    cfg = {key: (value, "default") for key, value in defaults.items()}
+    try:
+        options = json.loads(os.environ.get(OPTIONS_ENV) or "{}")
+    except ValueError:
+        options = {}
+    # /config hands over every field, defaults filled in; only a changed one is credited to it.
+    for key, value in options.items():
+        if key in defaults:
+            cfg[key] = (value, "default" if value == defaults[key] else "/config")
+    for var, key in ENV_OVERRIDES.items():
         if os.environ.get(var):
-            cfg[key] = os.environ[var]
+            cfg[key] = (os.environ[var], var)
+    # "localhost:1234" is easy to type and urllib refuses it without a scheme.
+    url, source = cfg.get("llm_base_url", ("", "default"))
+    if url and "://" not in url:
+        cfg["llm_base_url"] = (f"http://{url}", source)
     return cfg
+
+
+def load_config():
+    return {key: value for key, (value, _) in load_config_sources().items()}
 
 
 def as_bool(value):
@@ -346,6 +372,28 @@ def run_local_llm(cfg, model, system_prompt, user_content):
 PROVIDERS = ("local", "anthropic")
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
+# Haiku 4.5's context window, which has to hold the prompt and the reply. The other
+# current Claude models take 1M tokens, more than any sensible max_transcript_chars.
+HAIKU_CONTEXT_TOKENS = 200_000
+# Transcripts full of code and paths run denser than prose's ~4; err towards more tokens.
+CHARS_PER_TOKEN = 3.5
+
+
+def haiku_overflow(cfg, model):
+    """Why the configured sizes can't fit a Haiku model's context, or None."""
+    if "haiku" not in model.lower():
+        return None
+    chars = int(cfg.get("max_transcript_chars", 100000))
+    system_chars = len((PLUGIN_ROOT / "prompts" / "handoff-system.md").read_text())
+    output = int(cfg.get("max_output_tokens", 16384))
+    needed = (chars + system_chars) / CHARS_PER_TOKEN + output
+    if needed <= HAIKU_CONTEXT_TOKENS:
+        return None
+    fits = int((HAIKU_CONTEXT_TOKENS - output) * CHARS_PER_TOKEN - system_chars) // 10_000 * 10_000
+    return (f"max_transcript_chars {chars} (~{round(chars / CHARS_PER_TOKEN / 1000)}k tokens) plus "
+            f"max_output_tokens {output} won't fit {model}'s 200k-token context; "
+            f"set max_transcript_chars to {fits} or less, or use a bigger model")
+
 
 def provider_of(cfg):
     return str(cfg.get("provider", "anthropic")).strip().lower()
@@ -362,7 +410,9 @@ def handoff_backend(cfg, timeout=1.5):
         effort = str(cfg.get("anthropic_effort", "low")).lower()
         if effort not in EFFORTS:
             return provider, None, f"anthropic_effort must be one of {', '.join(EFFORTS)}, not {effort!r}"
-        return provider, cfg.get("anthropic_model") or "haiku", None
+        model = cfg.get("anthropic_model") or "haiku"
+        overflow = haiku_overflow(cfg, model)
+        return (provider, None, overflow) if overflow else (provider, model, None)
     if provider == "local":
         model, reason = probe_model(cfg, timeout=timeout)
         return provider, model, reason
@@ -391,7 +441,7 @@ def cmd_check(cfg, args):
                context_tokens=ctx)
     if out["stale"]:  # only probe when the answer will be shown
         out["provider"], out["handoff_model"], out["handoff_unavailable_reason"] = handoff_backend(cfg)
-        out["offer_auto_handoff"] = as_bool(cfg.get("offer_auto_handoff", False))
+        out["auto_continue_choice"] = as_bool(cfg.get("auto_continue_choice", False))
     return out
 
 
@@ -462,6 +512,12 @@ def cmd_save(cfg, args):
     return {"ok": True, "path": str(out_file), "text": handoff}
 
 
+def cmd_config(cfg, args):
+    settings = [{"key": key, "value": value, "source": source}
+                for key, (value, source) in load_config_sources().items()]
+    return {"ok": True, "settings": settings}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -477,9 +533,11 @@ def main():
     save.add_argument("--cwd", default=os.getcwd())
     save.add_argument("--provider", required=True, choices=PROVIDERS)
     save.add_argument("--model", required=True)
+    sub.add_parser("config")
     args = parser.parse_args()
 
-    commands = {"check": cmd_check, "prepare": cmd_prepare, "complete": cmd_complete, "save": cmd_save}
+    commands = {"check": cmd_check, "prepare": cmd_prepare, "complete": cmd_complete, "save": cmd_save,
+                "config": cmd_config}
     cfg = load_config()
     try:
         result = commands[args.command](cfg, args)

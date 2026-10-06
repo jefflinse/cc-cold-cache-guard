@@ -4,7 +4,7 @@
   "fallback_ttl_minutes": 60,
 
   "provider": "anthropic",
-  "offer_auto_handoff": false,
+  "auto_continue_choice": false,
 
   "llm_base_url": "http://localhost:1234",
   "model": "",

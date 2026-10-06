@@ -1,4 +1,4 @@
-import type { EngineInterface, ModelEffort, Register } from 'claude-code'
+import type { EngineInterface, ModelEffort, PluginOptions, Register } from 'claude-code'
 
 // The heavy lifting (reading the transcript, condensing it, calling LM Studio,
 // writing the handoff file) lives in bin/stale_guard.py; this module owns the
@@ -16,7 +16,7 @@ type Check = {
   provider?: Provider
   handoff_model?: string | null
   handoff_unavailable_reason?: string | null
-  offer_auto_handoff?: boolean
+  auto_continue_choice?: boolean
   error?: string
 }
 
@@ -40,6 +40,10 @@ type Completed = { ok: true; text: string; note?: string } | Failure
 
 type Saved = { ok: true; path: string; text: string } | Failure
 
+type Settings = { ok: true; settings: { key: string; value: unknown; source: string }[] } | Failure
+
+const CONFIGURE = 'cold-cache-guard-configure'
+
 const HANDOFF_TIMEOUT_MS = 600_000 // $.process.run's ceiling
 
 // A prompt sent this soon after the last turn cannot have a cold cache (the
@@ -51,9 +55,24 @@ const kTokens = (n: number | null) => (n ? `~${Math.round(n / 1000)}k tokens` : 
 // Module state; a hot reload resets it, which is harmless.
 let lastTurnAt = 0
 let handoffRunning = false
+// The settings screen's values, defaults filled in; register runs again whenever one changes.
+let pluginOptions: PluginOptions = {}
+
+/** The id `/plugin configure` takes, as enabledPlugins names it. */
+async function pluginId($: EngineInterface) {
+  const { enabledPlugins } = (await $.settings.read()) as { enabledPlugins?: Record<string, unknown> }
+  // `<name>@<marketplace>` when installed, `<name>` or `<name>@inline` from --plugin-dir.
+  const name = $.plugin.name
+  return Object.keys(enabledPlugins ?? {}).find(key => key === name || key.startsWith(`${name}@`)) ?? name
+}
 
 function script($: EngineInterface) {
   return `${$.plugin.root}/bin/stale_guard.py`
+}
+
+// stale_guard.py layers these over config.json; STALE_GUARD_* env vars still win.
+function scriptEnv() {
+  return { STALE_GUARD_PLUGIN_OPTIONS: JSON.stringify(pluginOptions) }
 }
 
 /** Runs one stale_guard.py command; output that isn't JSON becomes a failure. */
@@ -64,6 +83,7 @@ async function engine<T extends { ok: boolean }>(
 ): Promise<T | Failure> {
   const { stdout, stderr } = await $.process.run(['python3', script($), ...args], {
     stdin,
+    env: scriptEnv(),
     timeoutMs: HANDOFF_TIMEOUT_MS,
   })
   try {
@@ -75,7 +95,7 @@ async function engine<T extends { ok: boolean }>(
 
 async function check($: EngineInterface): Promise<Check | null> {
   const sessionId = await $.session.id()
-  const { stdout } = await $.process.run(['python3', script($), 'check', '--session-id', sessionId])
+  const { stdout } = await $.process.run(['python3', script($), 'check', '--session-id', sessionId], { env: scriptEnv() })
   const result = JSON.parse(stdout) as Check
   if (result.error) {
     $.ui.log(`stale-guard: check failed (prompt allowed through): ${result.error}`, { to: 'debug' })
@@ -220,13 +240,45 @@ async function runHandoff($: EngineInterface, held: string, auto = false) {
   }
 }
 
-export const register: Register = on => {
+/** The effective settings, one per line, with where each came from. */
+async function describeSettings($: EngineInterface, configure: string): Promise<string> {
+  const result = await engine<Settings>($, ['config'])
+  if (!result.ok) return `Couldn't read the settings: ${result.error}`
+  const width = Math.max(...result.settings.map(s => s.key.length))
+  const lines = result.settings.map(({ key, value, source }) => {
+    const from = source === 'default' ? '' : `  (from ${source})`
+    return `  ${key.padEnd(width)}  ${JSON.stringify(value)}${from}`
+  })
+  return [
+    'Current settings:',
+    ...lines,
+    '',
+    `Change them with ${configure} (opening it now). STALE_GUARD_* env vars still win over it.`,
+  ].join('\n')
+}
+
+export const register: Register = (on, options) => {
+  pluginOptions = options
+
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'handoff',
-      description: 'Summarize this session into a handoff for a new session (local LLM or Claude, per stale-guard config)',
+      description: "Summarize this session into a handoff for a new session (local LLM or Claude, per the plugin's settings)",
+    })
+    await $.command.register({
+      name: CONFIGURE,
+      description: "Show cc-cold-cache-guard's settings and open its settings screen",
     })
     return next(e)
+  })
+
+  on('command.run', { command: CONFIGURE }, async $ => {
+    // The plugin's own settings screen, not the whole /config menu.
+    const args = `configure ${await pluginId($)}`
+    const text = await describeSettings($, `/plugin ${args}`)
+    // Queued: it opens once this command's output is shown.
+    $.clock.after(0, () => void $.command.run({ command: 'plugin', args }).catch(() => {}))
+    return { text }
   })
 
   on('command.run', { command: 'handoff' }, async $ => {
@@ -255,7 +307,7 @@ export const register: Register = on => {
   on('prompt.submit', async ($, e, next) => {
     // Only guard what the person typed (terminal or Remote Control).
     if (e.origin.kind !== 'composer' && e.origin.kind !== 'bridge') return next(e)
-    const override = Number(await $.env.get('STALE_GUARD_IDLE_MINUTES'))
+    const override = Number((await $.env.get('STALE_GUARD_IDLE_MINUTES')) || pluginOptions.idle_minutes)
     const warmMs = override > 0 ? Math.min(WARM_MS, override * 60_000) : WARM_MS
     if ((await $.clock.now()) - lastTurnAt < warmMs) return next(e)
 
@@ -265,11 +317,11 @@ export const register: Register = on => {
     const model = status.handoff_model ?? null
     const who = model ? describeModel(status.provider, model) : null
     const handoff = who ? `Generate a handoff prompt using ${who}` : null
-    const autoHandoff =
-      who && status.offer_auto_handoff ? `Generate a handoff using ${who} and continue in a fresh session with it right away` : null
+    const autoContinue =
+      who && status.auto_continue_choice ? `Generate a handoff using ${who} and continue in a fresh session with it right away` : null
     const send = `Send anyway (re-caches ${kTokens(status.context_tokens)})`
     const hold = "Don't send (put it back in the input box)"
-    const options = [handoff, autoHandoff, send, hold].filter((o): o is string => o !== null)
+    const options = [handoff, autoContinue, send, hold].filter((o): o is string => o !== null)
     const unavailable = who ? '' : ` (Handoff unavailable: ${status.handoff_unavailable_reason ?? 'no model'}.)`
     let choice: string
     try {
@@ -284,8 +336,8 @@ export const register: Register = on => {
 
     if (choice === send) return next(e)
 
-    if (choice === handoff || choice === autoHandoff) {
-      const auto = choice === autoHandoff
+    if (choice === handoff || choice === autoContinue) {
+      const auto = choice === autoContinue
       $.clock.after(0, () => void runHandoff($, e.text, auto))
       return {
         drop: auto

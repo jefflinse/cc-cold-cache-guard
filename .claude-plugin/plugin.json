@@ -1,8 +1,114 @@
 {
   "name": "cc-cold-cache-guard",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": {
     "name": "Jeff Linse"
   },
-  "description": "Holds prompts sent to a session whose prompt cache has gone cold, and offers a cheap handoff (summarized by a local LLM or a small Claude model) instead of an expensive full cache write."
+  "description": "Holds prompts sent to a session whose prompt cache has gone cold, and offers a cheap handoff (summarized by a local LLM or a small Claude model) instead of an expensive full cache write.",
+  "userConfig": {
+    "provider": {
+      "type": "string",
+      "title": "Handoff provider",
+      "description": "Who summarizes the handoff: Claude through this session's API (anthropic) or a local OpenAI-compatible server such as LM Studio (local).",
+      "options": [
+        "anthropic",
+        "local"
+      ],
+      "default": "anthropic"
+    },
+    "anthropic_model": {
+      "type": "string",
+      "title": "Claude model",
+      "description": "Anthropic provider only. An alias (haiku, sonnet, opus) or a full model id.",
+      "default": "haiku"
+    },
+    "anthropic_effort": {
+      "type": "string",
+      "title": "Claude effort",
+      "description": "Anthropic provider only. Ignored by models without an effort setting, including Haiku 4.5.",
+      "options": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default": "low"
+    },
+    "auto_continue_choice": {
+      "type": "boolean",
+      "title": "Auto-continue choice",
+      "description": "Add a cold-cache option that generates the handoff, runs /clear and sends it right away.",
+      "default": false
+    },
+    "idle_minutes": {
+      "type": "string",
+      "title": "Idle threshold (minutes)",
+      "description": "Minutes of idleness before a prompt is held. auto = the cache TTL detected from the transcript minus the margin below.",
+      "default": "auto"
+    },
+    "auto_margin_minutes": {
+      "type": "number",
+      "title": "Auto margin (minutes)",
+      "description": "With idle_minutes auto: how many minutes before the cache TTL to start holding prompts.",
+      "min": 0,
+      "default": 2
+    },
+    "fallback_ttl_minutes": {
+      "type": "number",
+      "title": "Fallback cache TTL (minutes)",
+      "description": "Cache TTL assumed when the transcript doesn't show one.",
+      "min": 1,
+      "default": 60
+    },
+    "llm_base_url": {
+      "type": "string",
+      "title": "Local server URL",
+      "description": "Local provider only. Base URL of the OpenAI-compatible server.",
+      "default": "http://localhost:1234"
+    },
+    "model": {
+      "type": "string",
+      "title": "Local model",
+      "description": "Local provider only. Empty = the first loaded model.",
+      "default": ""
+    },
+    "temperature": {
+      "type": "number",
+      "title": "Local temperature",
+      "description": "Local provider only. Sampling temperature.",
+      "min": 0,
+      "max": 2,
+      "default": 0.2
+    },
+    "request_timeout_seconds": {
+      "type": "number",
+      "title": "Request timeout (seconds)",
+      "description": "Limit for the summarizing call; must stay below the hooks module's 10-minute limit.",
+      "min": 10,
+      "max": 590,
+      "default": 540
+    },
+    "max_output_tokens": {
+      "type": "number",
+      "title": "Max handoff tokens",
+      "description": "Output cap for the handoff. Anthropic caps it at 64000.",
+      "min": 1024,
+      "max": 64000,
+      "default": 16384
+    },
+    "max_transcript_chars": {
+      "type": "number",
+      "title": "Max transcript characters",
+      "description": "How much of the condensed transcript is sent to the summarizer (100000 is about 25k tokens).",
+      "min": 10000,
+      "default": 100000
+    },
+    "handoff_dir": {
+      "type": "string",
+      "title": "Handoff folder",
+      "description": "Where handoff files are saved.",
+      "default": "~/.claude/handoffs"
+    }
+  }
 }

@@ -48,12 +48,13 @@ class StaleGuardTest(unittest.TestCase):
         self.transcript.write_text("\n".join(json.dumps(e) for e in transcript_lines(idle_minutes)) + "\n")
 
     def configure(self, **overrides):
-        cfg = {"llm_base_url": NO_SERVER, "handoff_dir": str(self.handoff_dir), **overrides}
-        (self.claude_dir / "stale-guard.json").write_text(json.dumps(cfg))
+        """The plugin's settings, as the hooks module passes them."""
+        self.options = {"llm_base_url": NO_SERVER, "handoff_dir": str(self.handoff_dir), **overrides}
 
     def run_cmd(self, *args, stdin="", env=None):
         full_env = {k: v for k, v in os.environ.items() if not k.startswith("STALE_GUARD_")}
-        full_env.update(CLAUDE_CONFIG_DIR=str(self.claude_dir), **(env or {}))
+        full_env.update(CLAUDE_CONFIG_DIR=str(self.claude_dir), STALE_GUARD_PLUGIN_OPTIONS=json.dumps(self.options),
+                        **(env or {}))
         proc = subprocess.run([sys.executable, str(SCRIPT), *args], input=stdin, capture_output=True,
                               text=True, env=full_env, timeout=60)
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -78,14 +79,14 @@ class StaleGuardTest(unittest.TestCase):
         self.assertEqual(out["provider"], "local")
         self.assertIsNone(out["handoff_model"])
         self.assertIn("no local LLM server", out["handoff_unavailable_reason"])
-        self.assertFalse(out["offer_auto_handoff"])
+        self.assertFalse(out["auto_continue_choice"])
 
     def test_check_anthropic_is_always_available(self):
-        self.configure(provider="anthropic", offer_auto_handoff=True)
+        self.configure(provider="anthropic", auto_continue_choice=True)
         out = self.run_cmd("check", "--session-id", SESSION)
         self.assertEqual((out["provider"], out["handoff_model"], out["handoff_unavailable_reason"]),
                          ("anthropic", "haiku", None))
-        self.assertTrue(out["offer_auto_handoff"])
+        self.assertTrue(out["auto_continue_choice"])
 
     def test_check_env_overrides_provider_and_model(self):
         out = self.run_cmd("check", "--session-id", SESSION,
@@ -97,6 +98,54 @@ class StaleGuardTest(unittest.TestCase):
         out = self.run_cmd("check", "--session-id", SESSION)
         self.assertIsNone(out["handoff_model"])
         self.assertIn("anthropic_effort must be one of", out["handoff_unavailable_reason"])
+
+    # ------------------------------------------------------------ config layers
+
+    def settings(self, env=None):
+        out = self.run_cmd("config", env=env)
+        self.assertTrue(out["ok"], out)
+        return {s["key"]: (s["value"], s["source"]) for s in out["settings"]}
+
+    def test_config_options_override_defaults_and_env_overrides_options(self):
+        self.configure(provider="local", anthropic_model="sonnet", anthropic_effort="low")
+        got = self.settings(env={"STALE_GUARD_ANTHROPIC_MODEL": "opus"})
+        self.assertEqual(got["provider"], ("local", "/config"))
+        self.assertEqual(got["anthropic_model"], ("opus", "STALE_GUARD_ANTHROPIC_MODEL"))
+        self.assertEqual(got["anthropic_effort"], ("low", "default"))  # set, but to the default
+        self.assertEqual(got["max_transcript_chars"], (100000, "default"))  # not passed at all
+
+    def test_config_local_url_without_scheme_gets_http(self):
+        self.configure(llm_base_url="localhost:1234")
+        self.assertEqual(self.settings()["llm_base_url"], ("http://localhost:1234", "/config"))
+
+    def test_config_options_reach_check(self):
+        self.configure(anthropic_model="sonnet", auto_continue_choice=True)
+        out = self.run_cmd("check", "--session-id", SESSION)
+        self.assertEqual(out["handoff_model"], "sonnet")
+        self.assertTrue(out["auto_continue_choice"])
+
+    def test_manifest_userconfig_matches_config_json(self):
+        manifest = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text())
+        defaults = json.loads((ROOT / "config.json").read_text())
+        self.assertEqual({k: f["default"] for k, f in manifest["userConfig"].items()}, defaults)
+
+    def test_check_transcript_limit_too_big_for_haiku_says_why(self):
+        self.configure(provider="anthropic", max_transcript_chars=1_000_000, max_output_tokens=20000)
+        out = self.run_cmd("check", "--session-id", SESSION)
+        self.assertIsNone(out["handoff_model"])
+        self.assertIn("won't fit haiku's 200k-token context", out["handoff_unavailable_reason"])
+        self.assertIn("set max_transcript_chars to 620000 or less", out["handoff_unavailable_reason"])
+
+    def test_check_big_transcript_limit_is_fine_for_a_1m_model(self):
+        self.configure(provider="anthropic", anthropic_model="sonnet", max_transcript_chars=1_000_000)
+        out = self.run_cmd("check", "--session-id", SESSION)
+        self.assertEqual(out["handoff_model"], "sonnet")
+
+    def test_prepare_refuses_a_transcript_limit_too_big_for_haiku(self):
+        self.configure(provider="anthropic", anthropic_model="claude-haiku-4-5", max_transcript_chars=1_000_000)
+        out = self.run_cmd("prepare", "--session-id", SESSION, "--cwd", "/repo")
+        self.assertFalse(out["ok"])
+        self.assertIn("won't fit claude-haiku-4-5's", out["error"])
 
     # ------------------------------------------------------------ prepare
 

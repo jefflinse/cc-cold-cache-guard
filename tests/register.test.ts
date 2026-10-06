@@ -26,7 +26,7 @@ const STALE = {
   provider: 'local',
   handoff_model: 'google/gemma-4-26b-a4b-qat',
   handoff_unavailable_reason: null,
-  offer_auto_handoff: false,
+  auto_continue_choice: false,
 }
 
 const PREPARED = {
@@ -50,7 +50,7 @@ const ANSWERED: ModelCompleteResult = {
 function world(on: On, fakes: Fakes = {}) {
   const w = {
     asked: [] as { question: string; options: readonly string[] }[],
-    runs: [] as { command: string; argv: readonly string[]; stdin: string }[],
+    runs: [] as { command: string; argv: readonly string[]; stdin: string; env?: Record<string, string> }[],
     completions: [] as ModelCompleteRequest[],
     commands: [] as string[],
     filled: [] as string[],
@@ -59,6 +59,13 @@ function world(on: On, fakes: Fakes = {}) {
     toasts: [] as string[],
   }
   const scripted: Record<string, unknown> = {
+    config: {
+      ok: true,
+      settings: [
+        { key: 'provider', value: 'anthropic', source: 'default' },
+        { key: 'auto_continue_choice', value: true, source: '/config' },
+      ],
+    },
     check: fakes.check ?? STALE,
     prepare: fakes.prepare ?? PREPARED,
     complete: fakes.complete ?? { ok: true, text: '## Goal\nShip it.' },
@@ -68,9 +75,12 @@ function world(on: On, fakes: Fakes = {}) {
   on('session.id', async () => ({ value: SESSION }))
   on('session.cwd', async () => ({ value: '/repo' }))
   on('env.get', async () => ({ value: undefined }))
+  on('settings.read', async () => ({
+    value: { enabledPlugins: { 'cc-cold-cache-guard@cc-cold-cache-guard': true } },
+  }))
   on('process.run', async (_$, e) => {
     const command = e.argv[2] ?? ''
-    w.runs.push({ command, argv: e.argv, stdin: e.init?.stdin ?? '' })
+    w.runs.push({ command, argv: e.argv, stdin: e.init?.stdin ?? '', env: e.init?.env })
     const stdout = JSON.stringify(scripted[command])
     return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } as ProcessRunResult }
   })
@@ -87,7 +97,7 @@ function world(on: On, fakes: Fakes = {}) {
     return { result: { questions: [q], answers: { [q.question]: answer } } } as unknown as ToolCallResult
   })
   on('command.run', async (_$, e) => {
-    w.commands.push(e.command)
+    w.commands.push(e.args ? `${e.command} ${e.args}` : e.command)
     return { text: '' }
   })
   on('prompt.fill', async (_$, e) => {
@@ -135,10 +145,10 @@ describe('the cold-cache dialog', () => {
     ])
   })
 
-  test('adds the auto option second when offer_auto_handoff is on', async ($, on) => {
+  test('adds the auto option second when auto_continue_choice is on', async ($, on) => {
     mock.clock(on, { now: 10 * 60_000 })
     const w = world(on, {
-      check: { ...STALE, provider: 'anthropic', handoff_model: 'haiku', offer_auto_handoff: true },
+      check: { ...STALE, provider: 'anthropic', handoff_model: 'haiku', auto_continue_choice: true },
       pick: pickContaining('Send anyway'),
     })
     await $.prompt.submit(typed('hello'))
@@ -153,7 +163,7 @@ describe('the cold-cache dialog', () => {
   test('says why when no handoff model is available', async ($, on) => {
     mock.clock(on, { now: 10 * 60_000 })
     const w = world(on, {
-      check: { ...STALE, handoff_model: null, handoff_unavailable_reason: 'LM Studio is running but no model is loaded', offer_auto_handoff: true },
+      check: { ...STALE, handoff_model: null, handoff_unavailable_reason: 'LM Studio is running but no model is loaded', auto_continue_choice: true },
       pick: pickContaining("Don't send"),
     })
     const r = await $.prompt.submit(typed('hello'))
@@ -213,7 +223,7 @@ describe('generating the handoff', () => {
   test('auto: skips the follow-up question, clears and submits the handoff as the user', async ($, on) => {
     const clock = mock.clock(on, { now: 10 * 60_000 })
     const w = world(on, {
-      check: { ...STALE, provider: 'anthropic', handoff_model: 'haiku', offer_auto_handoff: true },
+      check: { ...STALE, provider: 'anthropic', handoff_model: 'haiku', auto_continue_choice: true },
       pick: pickContaining('right away'),
     })
     const r = await $.prompt.submit(typed('next thing'))
@@ -232,7 +242,7 @@ describe('generating the handoff', () => {
   test('an Anthropic API error gives the held message back and skips the LM Studio hint', async ($, on) => {
     const clock = mock.clock(on, { now: 10 * 60_000 })
     const w = world(on, {
-      check: { ...STALE, provider: 'anthropic', handoff_model: 'haiku', offer_auto_handoff: true },
+      check: { ...STALE, provider: 'anthropic', handoff_model: 'haiku', auto_continue_choice: true },
       reply: {
         isAnswered: false,
         reason: 'api-error',
@@ -274,5 +284,29 @@ describe('generating the handoff', () => {
 
     expect(JSON.parse(w.runs.find(r => r.command === 'save')!.stdin)).toEqual({ body: '## Goal\nShip it.', held: '' })
     expect(w.asked.map(a => a.question)).toEqual(['Your handoff is ready. What do you want to do with it?'])
+  })
+})
+
+const RUN = { args: '', origin: { kind: 'composer' as const }, presentation: { isFullscreen: false, columns: 80 } }
+
+describe('settings', () => {
+  test('the settings reach stale_guard.py', { options: { anthropic_model: 'sonnet' } }, async ($, on) => {
+    mock.clock(on, { now: 10 * 60_000 })
+    const w = world(on, { pick: pickContaining('Send anyway') })
+    await $.prompt.submit(typed('hello'))
+    const options = JSON.parse(w.runs.find(r => r.command === 'check')!.env!.STALE_GUARD_PLUGIN_OPTIONS!)
+    expect(options.anthropic_model).toBe('sonnet')
+    expect(options.provider).toBe('anthropic')
+  })
+
+  test("/cold-cache-guard-configure lists the settings and opens the plugin's settings screen", async ($, on) => {
+    const clock = mock.clock(on, { now: 10 * 60_000 })
+    const w = world(on)
+    const r = await $.command.run({ command: 'cold-cache-guard-configure', ...RUN })
+    await clock.settle()
+    expect(r.text).toContain('provider              "anthropic"\n')
+    expect(r.text).toContain('auto_continue_choice  true  (from /config)')
+    expect(r.text).toContain('Change them with /plugin configure cc-cold-cache-guard@cc-cold-cache-guard')
+    expect(w.commands).toContain('plugin configure cc-cold-cache-guard@cc-cold-cache-guard')
   })
 })
