@@ -12,6 +12,8 @@ type Check = {
   idle_text?: string
   ttl_minutes: number | null
   context_tokens: number | null
+  /** Idle long enough, but Claude Code compacted the session before its cache expired. */
+  idle_compacted?: boolean
   /** Only present when stale: the model a handoff would use, or why there is none. */
   provider?: Provider
   handoff_model?: string | null
@@ -312,6 +314,9 @@ export const register: Register = (on, options) => {
     if ((await $.clock.now()) - lastTurnAt < warmMs) return next(e)
 
     const status = await check($)
+    if (status?.idle_compacted) {
+      $.ui.log('stale-guard: Claude Code compacted this session while it was idle; prompt allowed through', { to: 'debug' })
+    }
     if (!status?.stale) return next(e)
 
     const model = status.handoff_model ?? null

@@ -11,6 +11,8 @@ When you send a message to a cold session, the message is held and Claude Code's
 - **Send anyway**: the message goes through untouched and pays for the cache write.
 - **Don't send** (or Esc): your message goes back to the input box.
 
+The guard stays out of the way when Claude Code's own idle compaction ran after the last message ("Compacted while idle, before the prompt cache expired"). The session is already down to its summary, so re-caching it is cheap.
+
 It also adds a `/handoff` command for generating a handoff any time, a `/cold-cache-guard-configure` command that lists the current settings and opens the plugin's settings screen, and shows a toast when you `--resume` a cold session.
 
 A handoff has four parts:

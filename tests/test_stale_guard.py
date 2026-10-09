@@ -115,6 +115,33 @@ class StaleGuardTest(unittest.TestCase):
         self.assertFalse(out["stale"])
         self.assertNotIn("provider", out)
 
+    def append_entries(self, *entries):
+        with self.transcript.open("a") as f:
+            f.writelines(json.dumps(e) + "\n" for e in entries)
+
+    IDLE_COMPACTED = {"type": "system", "subtype": "informational", "level": "notice",
+                      "content": "Compacted while idle, before the prompt cache expired"}
+
+    def test_check_idle_compaction_as_the_last_entry_is_not_stale(self):
+        # As Claude Code writes it: the summary, its attachments, the notice, then session metadata.
+        self.append_entries({"type": "system", "subtype": "compact_boundary"},
+                            user("This session is being continued from a previous conversation...",
+                                 isCompactSummary=True),
+                            {"type": "attachment"}, self.IDLE_COMPACTED,
+                            {"type": "last-prompt"}, {"type": "ai-title"})
+        out = self.run_cmd("check", "--session-id", SESSION)
+        self.assertFalse(out["stale"])
+        self.assertTrue(out["idle_compacted"])
+        self.assertNotIn("provider", out)
+
+    def test_check_idle_compaction_followed_by_a_message_is_still_stale(self):
+        stale_ts = transcript_lines(120)[0]["timestamp"]
+        self.append_entries(self.IDLE_COMPACTED, user("one more thing", timestamp=stale_ts),
+                            {**assistant(text("Done.")), "timestamp": stale_ts})
+        out = self.run_cmd("check", "--session-id", SESSION)
+        self.assertTrue(out["stale"])
+        self.assertNotIn("idle_compacted", out)
+
     def test_check_defaults_to_anthropic(self):
         out = self.run_cmd("check", "--session-id", SESSION)
         self.assertEqual((out["provider"], out["handoff_model"]), ("anthropic", "haiku"))

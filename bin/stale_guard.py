@@ -167,6 +167,27 @@ def session_activity(transcript_path):
     return last_ts, None, ctx
 
 
+# Claude Code's own idle compaction (2.1.29x) logs this notice after compacting a large, idle
+# session just before its 1h cache would expire.
+IDLE_COMPACT_NOTICE = "Compacted while idle"
+
+
+def idle_compacted_last(transcript_path):
+    """True when Claude Code's idle-compaction notice comes after the last message.
+
+    The conversation is then just the compaction summary, so re-caching it is cheap.
+    """
+    for e in tail_entries(transcript_path):
+        if e.get("isSidechain"):
+            continue
+        if e.get("type") in ("user", "assistant"):
+            return False
+        content = e.get("content")
+        if e.get("type") == "system" and isinstance(content, str) and content.startswith(IDLE_COMPACT_NOTICE):
+            return True
+    return False
+
+
 def find_transcript(session_id):
     matches = sorted((CLAUDE_DIR / "projects").glob(f"*/{session_id}.jsonl"), key=lambda p: p.stat().st_mtime)
     return matches[-1] if matches else None
@@ -537,6 +558,8 @@ def cmd_check(cfg, args):
     out.update(stale=idle >= limit, idle_minutes=round(idle, 1), idle_text=fmt_duration(idle),
                threshold_minutes=limit, ttl_minutes=ttl or float(cfg.get("fallback_ttl_minutes", 60)),
                context_tokens=ctx)
+    if out["stale"] and idle_compacted_last(transcript):
+        out.update(stale=False, idle_compacted=True)
     if out["stale"]:  # only probe when the answer will be shown
         out["provider"], out["handoff_model"], out["handoff_unavailable_reason"] = handoff_backend(cfg)
         out["auto_continue_choice"] = as_bool(cfg.get("auto_continue_choice", False))
