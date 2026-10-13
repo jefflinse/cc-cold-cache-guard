@@ -183,6 +183,16 @@ async function offerNextStep($: EngineInterface, path: string, text: string) {
   if (choice === FRESH) await startFresh($, path, text, false)
 }
 
+/**
+ * Claude Code 2.1.296 and later put a dropped prompt back in the input box. A
+ * held one goes into the handoff instead, so take it out, unless the person
+ * has already typed over it.
+ */
+async function clearHeld($: EngineInterface, held: string) {
+  const box = await $.prompt.read()
+  if (box.text.trim() === held.trim()) await $.prompt.fill({ text: '' })
+}
+
 /** `auto`: skip the follow-up question and continue in a fresh session with the handoff. */
 async function runHandoff($: EngineInterface, held: string, auto = false) {
   if (handoffRunning) {
@@ -205,6 +215,7 @@ async function runHandoff($: EngineInterface, held: string, auto = false) {
     if (held) await $.prompt.fill({ text: held })
   }
   try {
+    if (held) await clearHeld($, held)
     const sessionId = await $.session.id()
     const cwd = await $.session.cwd()
     const prepared = await engine<Prepared>($, ['prepare', '--session-id', sessionId, '--cwd', cwd])
@@ -352,6 +363,7 @@ export const register: Register = (on, options) => {
     }
 
     // Anything else (including free text typed under "Other"): give the message back.
+    // Claude Code 2.1.296 and later do this themselves; the fill is for older versions.
     $.clock.after(50, () => void $.prompt.fill({ text: e.text }))
     return { drop: 'Not sent. Your message is back in the input box.' }
   })
